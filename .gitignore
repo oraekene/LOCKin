@@ -1,0 +1,30 @@
+# Environment variables
+.env
+creds.env
+
+# Session files
+sessions/
+*.session
+*.session-journal
+
+# Data files
+data/
+crypto/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
