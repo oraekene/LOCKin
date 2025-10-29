@@ -1,9 +1,3 @@
-# README — Lockin / TelegramForwarder
-
-> **Status:** single-file prototype ( `main_bot(lastworkingasat4pm_beforeinlinemenuedits).py` ). This README explains installation, configuration, running, and how to use the bot’s features.
-
----
-
 ## Table of contents
 
 1. Features (short)
