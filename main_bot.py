@@ -78,16 +78,19 @@ SUBSCRIPTION_ENABLED = True
 
 # PAYMENT PROVIDER API KEYS & MODE
 # It is strongly recommended to load these from environment variables for security.
-# Paystack Keys
-PAYSTACK_TEST_SECRET_KEY = os.getenv('PAYSTACK_TEST_SECRET_KEY', 'sk_test_6d56ad65647e19f2792e734d0fa0663f8b7cb733')
-PAYSTACK_LIVE_SECRET_KEY = os.getenv('PAYSTACK_LIVE_SECRET_KEY', 'sk_live_1b8cbd7222fca9df744252b005b11fd1c1790e92')
+PAYSTACK_TEST_SECRET_KEY = os.getenv("PAYSTACK_TEST_SECRET_KEY")
+PAYSTACK_LIVE_SECRET_KEY = os.getenv("PAYSTACK_LIVE_SECRET_KEY")
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
 
-# NOWPayments Keys
-NOWPAYMENTS_API_KEY = os.getenv('NOWPAYMENTS_API_KEY', 'AMTWJPW-N0A47MS-H8XEPTJ-KQHCCQE')
-NOWPAYMENTS_IPN_SECRET = os.getenv('NOWPAYMENTS_IPN_SECRET', 'lPa44tGK9cp6lb8uSPC6jYlUI2XrWpFp')
+# Safe boolean parsing — prefers explicit env setting (default False)
+def _parse_bool_env(v, default=False):
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1","true","yes","y","on")
 
-# Set to True to use Paystack's test environment. Set to False for live payments.
-PAYSTACK_TEST_MODE = True
+PAYSTACK_TEST_MODE = _parse_bool_env(os.getenv("PAYSTACK_TEST_MODE"), default=False)
+
 
 # Path for storing payments (uses existing DATA_DIR variable in the monolith)
 PAYMENTS_STORE_PATH = os.path.join(DATA_DIR, "payments.json")
@@ -115,8 +118,8 @@ COMMISSIONS = {
 
 # This must be your server's public IP or a domain pointing to it.
 # For local testing, use a service like ngrok to get a temporary public URL.
-WEBHOOK_BASE_URL = os.getenv('WEBHOOK_BASE_URL', "http://your_server_ip_or_domain")
-WEBHOOK_PORT = int(os.getenv('WEBHOOK_PORT', 8000))
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL")  # required in production; validate at startup
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8001"))
 
 
 # FEATURE AND USAGE LIMITS FOR FREE VS. PAID USERS
@@ -199,9 +202,12 @@ def load_configuration():
     else:
         # Fallback to system environment
         load_dotenv()
-
-    # ADDED for Demo Mode
-    DEMO_MODE = os.getenv('DEMO_MODE') == 'False'
+        
+    def parse_bool(val, default=False):
+        if val is None:
+            return default
+        v = str(val).strip().lower()
+        return v in ("1", "true", "yes", "y", "on")
 
     # Required environment variables
     MASTER_SECRET = os.getenv('MASTER_SECRET')
@@ -225,17 +231,11 @@ def load_configuration():
         raise ValueError("BOT_API_ID must be a valid integer")
 
     # ADDED: Demo mode specific variables (only if demo mode is on)
-    DEMO_API_ID = None
-    DEMO_API_HASH = None
-    DEMO_PHONE_NUMBER = None
-    DEMO_SESSION_NAME = 'demo_session' # A default name
-
-    if DEMO_MODE:
-        DEMO_API_ID = os.getenv('DEMO_API_ID')
-        DEMO_API_HASH = os.getenv('DEMO_API_HASH')
-        DEMO_PHONE_NUMBER = os.getenv('DEMO_PHONE_NUMBER')
-        # Allow overriding session name via env
-        DEMO_SESSION_NAME = os.getenv('DEMO_SESSION_NAME', 'demo_session')
+    DEMO_MODE = parse_bool(os.getenv("DEMO_MODE"), default=False)
+    DEMO_API_ID = os.getenv("DEMO_API_ID")
+    DEMO_API_HASH = os.getenv("DEMO_API_HASH")
+    DEMO_PHONE_NUMBER = os.getenv("DEMO_PHONE_NUMBER")
+    DEMO_SESSION_NAME = os.getenv("DEMO_SESSION_NAME", "demo_session")
 
         # Validate demo vars
         if not all([DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER]):
