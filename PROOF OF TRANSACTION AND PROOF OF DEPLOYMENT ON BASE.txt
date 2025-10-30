@@ -1,0 +1,12 @@
+PROOF OF TRANSACTION AND PROOF OF DEPLOYMENT ON BASE
+(.venv2) ubuntu@instance-20241230-auto-job-applier:~/telegram-bot-monolith$ python3 run_proof.py 0x4BB3638d6a466CB871Ea1BaF52157596Ec856E8C 0.0001
+Using server wallet: 0x547720FE359D3530e78E6f56293F4B9Ccf1AbEF2
+Target: 0x4BB3638d6a466CB871Ea1BaF52157596Ec856E8C amount (native): 0.0001 chainId: 84532
+Signing transaction...
+Sending transaction...
+Transaction submitted. tx_hash = 8d69cd5888f58d408a9726f39e51ad8efecbc06d03eec3e7c67286fc400974ab
+Explorer URL: https://sepolia.basescan.org/tx/8d69cd5888f58d408a9726f39e51ad8efecbc06d03eec3e7c67286fc400974ab
+Waiting for transaction receipt (this may take a few seconds)...
+Receipt received: status = 1
+Block number: 32747343
+Done. Save the tx hash & explorer link as proof of deployment.
