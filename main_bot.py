@@ -119,7 +119,7 @@ COMMISSIONS = {
 # This must be your server's public IP or a domain pointing to it.
 # For local testing, use a service like ngrok to get a temporary public URL.
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL")  # required in production; validate at startup
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8001"))
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8005"))
 
 
 # FEATURE AND USAGE LIMITS FOR FREE VS. PAID USERS
@@ -154,6 +154,8 @@ USER_LIMITS = {
 
 # CoinGecko base URL (public API). Can set COINGECKO_API_URL env to override.
 COINGECKO_API_URL = os.getenv("COINGECKO_API_URL", "https://api.coingecko.com/api/v3")
+
+ONCHAINKIT_API_BASE_URL = "https://api.developer.coinbase.com/onchainkit/v1"
 
 # Map chain_id -> CoinGecko "platform id" for token price by contract.
 # Defaults assume Base uses platform slug "base". If this is wrong for your environment
@@ -193,6 +195,13 @@ logging.basicConfig(
 nest_asyncio.apply()
 
 # --- Load configuration from environment ---
+# Helper function moved to module level for better structure
+def parse_bool(val, default=False):
+    if val is None:
+        return default
+    v = str(val).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
 def load_configuration():
     """Load configuration from environment variables"""
     # Try to load from .env file in base path
@@ -202,12 +211,6 @@ def load_configuration():
     else:
         # Fallback to system environment
         load_dotenv()
-        
-    def parse_bool(val, default=False):
-        if val is None:
-            return default
-        v = str(val).strip().lower()
-        return v in ("1", "true", "yes", "y", "on")
 
     # Required environment variables
     MASTER_SECRET = os.getenv('MASTER_SECRET')
@@ -230,14 +233,21 @@ def load_configuration():
     except ValueError:
         raise ValueError("BOT_API_ID must be a valid integer")
 
-    # ADDED: Demo mode specific variables (only if demo mode is on)
+    # Demo mode configuration
     DEMO_MODE = parse_bool(os.getenv("DEMO_MODE"), default=False)
-    DEMO_API_ID = os.getenv("DEMO_API_ID")
-    DEMO_API_HASH = os.getenv("DEMO_API_HASH")
-    DEMO_PHONE_NUMBER = os.getenv("DEMO_PHONE_NUMBER")
-    DEMO_SESSION_NAME = os.getenv("DEMO_SESSION_NAME", "demo_session")
+    DEMO_API_ID = None
+    DEMO_API_HASH = None
+    DEMO_PHONE_NUMBER = None
+    DEMO_SESSION_NAME = 'demo_session' # A default name
 
-        # Validate demo vars
+    if DEMO_MODE:
+        DEMO_API_ID = os.getenv('DEMO_API_ID')
+        DEMO_API_HASH = os.getenv('DEMO_API_HASH')
+        DEMO_PHONE_NUMBER = os.getenv('DEMO_PHONE_NUMBER')
+        DEMO_SESSION_NAME = os.getenv('DEMO_SESSION_NAME', 'demo_session')
+
+        # --- CORRECTED INDENTATION AND LOGIC ---
+        # This validation block now correctly runs only if DEMO_MODE is True.
         if not all([DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER]):
             raise ValueError("DEMO_MODE is true, but DEMO_API_ID, DEMO_API_HASH, or DEMO_PHONE_NUMBER are missing.")
         try:
@@ -249,7 +259,7 @@ def load_configuration():
             DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME)
 
 
-# Load configuration
+# Load configuration (This line remains the same)
 (MASTER_SECRET, BOT_TOKEN, BOT_API_ID, BOT_API_HASH, DEMO_MODE,
  DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME) = load_configuration()
 
@@ -3030,15 +3040,23 @@ class TelegramForwarder:
 
     # REPLACED based on message_processing_integration.txt
     async def _process_message(self, message, job):
-        """Process message with enhanced error tracking and user notifications"""
+        """
+        Process message with buy flow, Hyperliquid, and standard forwarding,
+        based on the original tested logic for each job type.
+        """
         if not message.text:
             return
 
+        # --- Get Job Details ---
         forward_type = job.get('type')
-        job_results = None
         match_logic = job.get('match_logic', 'OR')
-        is_hl_dest = job.get('destination_ids') == ['hyperliquid_account']
+        job_results = None
 
+        # --- Check for Special Destinations ---
+        is_hl_dest = job.get('destination_ids') == ['hyperliquid_account']
+        is_buy_trigger_job = job.get('destination_ids') == ['base_buy_trigger']
+
+        # --- Process Based on Job Type ---
         if forward_type == 'keywords':
             keywords = job.get('keywords', [])
             match = (not keywords) or \
@@ -3048,7 +3066,14 @@ class TelegramForwarder:
             if match:
                 if is_hl_dest:
                     await self._execute_hyperliquid_trade(message, job)
-                else:
+                elif is_buy_trigger_job:
+                    # For a buy trigger, we must find a token address within the matched message
+                    token_address = self._find_ethereum_contract(message.text)
+                    if token_address:
+                        await self.bot_instance._initiate_buy_flow(self.user_id, job, token_address, message.id)
+                    else:
+                        logging.warning(f"Keyword job for user {self.user_id} triggered a buy, but no ETH address was found in the message.")
+                else: # Standard forwarding
                     job_results = await self._check_and_forward(message.text, f"keywords_{job.get('source_ids',[0])[0]}", job)
 
         elif forward_type == 'custom_pattern':
@@ -3062,30 +3087,44 @@ class TelegramForwarder:
                 if match:
                     if is_hl_dest:
                         await self._execute_hyperliquid_trade(message, job)
-                    else:
+                    elif is_buy_trigger_job:
+                        # Like keywords, we must find a token address
+                        token_address = self._find_ethereum_contract(message.text)
+                        if token_address:
+                            await self.bot_instance._initiate_buy_flow(self.user_id, job, token_address, message.id)
+                        else:
+                            logging.warning(f"Pattern job for user {self.user_id} triggered a buy, but no ETH address was found in the message.")
+                    else: # Standard forwarding
                         key = "&".join(patterns)
                         job_results = await self._check_and_forward(message.text, key, job)
             except re.error as e:
                 logging.warning(f"Invalid regex in job for user {self.user_id}: {e}")
 
         elif forward_type == 'solana':
+            # This job type is not compatible with the Base Buy Flow.
             if contract := self._find_solana_contract(message.text):
                 if is_hl_dest:
-                    # Create a temporary message object to pass the contract as text
                     temp_message = type('TempMessage', (), {'text': contract})()
                     await self._execute_hyperliquid_trade(temp_message, job)
-                else:
+                elif is_buy_trigger_job:
+                    logging.warning(f"Solana job for user {self.user_id} cannot trigger a Base buy flow.")
+                else: # Standard forwarding
                     job_results = await self._check_and_forward(contract, contract, job)
 
         elif forward_type == 'ethereum':
+            # This is the most direct case for the buy flow.
             if contract := self._find_ethereum_contract(message.text):
                 if is_hl_dest:
                     temp_message = type('TempMessage', (), {'text': contract})()
                     await self._execute_hyperliquid_trade(temp_message, job)
-                else:
+                elif is_buy_trigger_job:
+                    # The extracted contract IS the token to buy.
+                    await self.bot_instance._initiate_buy_flow(self.user_id, job, contract, message.id)
+                else: # Standard forwarding
                     job_results = await self._check_and_forward(contract, contract, job)
 
         elif forward_type == 'cashtags':
+            # This job type is not compatible with the Base Buy Flow as it doesn't provide a contract address.
             found_tags = self._find_cashtag(message.text)
             specified_tags = [st.lower() for st in job.get('cashtags', [])]
             for tag in found_tags:
@@ -3093,113 +3132,136 @@ class TelegramForwarder:
                     if is_hl_dest:
                         temp_message = type('TempMessage', (), {'text': tag})()
                         await self._execute_hyperliquid_trade(temp_message, job)
-                        break # Only process the first matched tag for HL
-                    else:
+                        break
+                    elif is_buy_trigger_job:
+                        logging.warning(f"Cashtag job for user {self.user_id} cannot trigger a Base buy flow. A cashtag is not a contract address.")
+                        break # Only log once per message
+                    else: # Standard forwarding
                         tag_results = await self._check_and_forward(tag, tag, job)
                         if tag_results and not job_results:
                             job_results = tag_results
 
-        # Notify user of any forwarding issues (if there's a bot reference and it wasn't a HL trade)
+        # Notify user of any standard forwarding issues
         if job_results and job_results.get('failed', 0) > 0 and hasattr(self, 'bot_instance'):
             await self.bot_instance.notify_user_of_forwarding_errors(self.user_id, job_results)
 
     # REPLACED based on enhanced_forwarding.txt
     async def _check_and_forward(self, text, key, job):
         """Forward message to all destinations with comprehensive error reporting"""
+        # --- Check Timer ---
         if not self._can_forward(key, job['type'], self._parse_timer(job.get('timer', ''))):
-            return
+            logging.debug(f"[{self.phone_number}] Cooldown active for key '{key}', type '{job['type']}'. Skipping forward.")
+            return None # Explicitly return None if skipped
 
+        # --- Get Event Loop (ADDED) ---
+        loop = asyncio.get_running_loop()
+
+        # --- Setup Destinations ---
         destination_ids = job.get('destination_ids', [])
-        if not destination_ids and not job.get('onchain_destinations'):
-            logging.warning(f"[{self.phone_number}] No destination IDs found for job type '{job['type']}'")
-            return
+        trader_endpoints = job.get('trader_endpoints', []) or []
+        onchain_dests = job.get('onchain_destinations', []) or []
 
-        # Track results for all destinations
+        # Ensure destination_ids contains only valid integer IDs if not special ['hyperliquid_account']
+        if destination_ids != ['hyperliquid_account']:
+             destination_ids = [int(did) for did in destination_ids if isinstance(did, (int, str)) and str(did).lstrip('-').isdigit()]
+
+
+        if not destination_ids and not onchain_dests and not trader_endpoints:
+            logging.warning(f"[{self.phone_number}] No valid destinations found for job '{job.get('job_name', 'Unnamed')}' (Type: {job['type']}) Key: {key}")
+            return None # Nothing to forward to
+
+        # --- Initialize Results ---
         results = []
         successful_forwards = 0
         failed_forwards = 0
+        logging.info(f"[{self.phone_number}] Forwarding for Job '{job.get('job_name', 'Unnamed')}' Key: {key}. Targets - TG:{len(destination_ids)}, Trader:{len(trader_endpoints)}, Onchain:{len(onchain_dests)}")
+        failed_details = [] # Store tuples of (type, dest, error)
 
-        logging.info(f"[{self.phone_number}] Starting forward operation to {len(destination_ids)} destinations")
-        failed_details = []
+        # --- 1. Telegram Forwards ---
+        if destination_ids and destination_ids != ['hyperliquid_account']: # Skip if HL is the only dest
+            for dest_id in destination_ids:
+                try:
+                    send_result = await self._send_message(dest_id, text) # _send_message returns a dict
+                    ok = send_result.get('success', False)
+                    results.append({"type": "telegram", "dest": dest_id, "ok": ok, "details": send_result})
+                    if ok:
+                        successful_forwards += 1
+                    else:
+                        failed_forwards += 1
+                        failed_details.append(("telegram", dest_id, send_result.get('error', 'Unknown TG error')))
+                except Exception as e:
+                    logging.exception(f"[{self.phone_number}] Critical error calling _send_message for {dest_id}: {e}")
+                    results.append({"type": "telegram", "dest": dest_id, "ok": False, "error": f"Critical: {str(e)}"})
+                    failed_forwards += 1
+                    failed_details.append(("telegram", dest_id, f"Critical: {str(e)}"))
 
-        # --- existing Telegram forwards (unchanged) ---
-        for dest_id in destination_ids:
-            try:
-                # existing send method; it may be self._send_message or similar
-                sent = await self._send_message(dest_id, text) if hasattr(self, "_send_message") else await self.send_message(dest_id, text)
-                ok = bool(sent)
-            except Exception as e:
-                ok = False
-                logging.exception(f"[{self.phone_number}] error sending to {dest_id}: {e}")
-
-            results.append({"dest": dest_id, "ok": ok})
-            if ok:
-                successful_forwards += 1
-            else:
-                failed_forwards += 1
-                failed_details.append(str(dest_id))
-                
-        # --- NEW: forward text to trader endpoints (if any) ---
-        trader_endpoints = job.get('trader_endpoints', []) or []
+        # --- 2. Trader Endpoints ---
         if trader_endpoints:
             for url in trader_endpoints:
                 try:
+                    # 'loop' is now defined
                     res = await loop.run_in_executor(None, forward_to_trader_endpoint, url, text, job.get('id'), self.user_id, {"source": "telegram_forward"})
+                    ok = res.get("ok", False)
+                    results.append({"type": "trader", "dest": url, "ok": ok, "resp": res})
+                    if ok:
+                        successful_forwards += 1
+                    else:
+                        failed_forwards += 1
+                        failed_details.append(("trader", url, res.get("error", "Unknown trader error")))
                 except Exception as e:
-                    res = {"ok": False, "error": str(e)}
-                if res.get("ok"):
-                    results.append({"dest": url, "ok": True, "resp": res})
-                    successful_forwards += 1
-                else:
-                    results.append({"dest": url, "ok": False, "error": res.get("error")})
+                    logging.exception(f"[{self.phone_number}] Critical error calling forward_to_trader_endpoint for {url}: {e}")
+                    results.append({"type": "trader", "dest": url, "ok": False, "error": f"Critical: {str(e)}"})
                     failed_forwards += 1
-                    failed_details.append(f"url:{res.get('error')}")
+                    failed_details.append(("trader", url, f"Critical: {str(e)}"))
 
-        # --- NEW: handle onchain destinations if present ---
-        onchain_dests = job.get('onchain_destinations', []) or []
+
+        # --- 3. Onchain Destinations ---
         onchain_transfer_enabled = bool(job.get('onchain_transfer', False)) or bool(job.get('onchain_amount'))
-        onchain_amount = job.get('onchain_amount') or job.get('amount_native') or 0
-        try:
-            onchain_amount = float(onchain_amount) if onchain_amount else 0.0
-        except Exception:
-            onchain_amount = 0.0
+        onchain_amount = job.get('onchain_amount') or job.get('amount_native') or 0.0 # Default to 0.0
+        try: onchain_amount = float(onchain_amount) if onchain_amount else 0.0
+        except Exception: onchain_amount = 0.0
 
         if onchain_dests and onchain_transfer_enabled and onchain_amount > 0:
-            logging.info(f"[{self.phone_number}] Executing onchain forwards to {len(onchain_dests)} destinations")
-            
-            loop = asyncio.get_running_loop()
+            logging.info(f"[{self.phone_number}] Executing onchain forwards ({onchain_amount}) to {len(onchain_dests)} destinations")
+            # 'loop' is already defined
             for dest in onchain_dests:
                 try:
-                    # Offload the synchronous transfer helper to a thread to avoid blocking.
                     res = await loop.run_in_executor(None, forward_to_base_account, dest, onchain_amount, job.get('id'), self.user_id, f"forward:{job.get('type')}")
+                    ok = res.get("ok", False)
+                    results.append({"type": "onchain", "dest": dest, "ok": ok, "resp": res})
+                    if ok:
+                        successful_forwards += 1
+                    else:
+                        failed_forwards += 1
+                        failed_details.append(("onchain", dest, res.get("error", "Unknown onchain error")))
                 except Exception as e:
-                    res = {"ok": False, "error": str(e)}
-
-                if res.get("ok"):
-                    successful_forwards += 1
-                    results.append({"dest": dest, "ok": True, "tx_hash": res.get("tx_hash"), "explorer": res.get("explorer_url")})
-                else:
+                    logging.exception(f"[{self.phone_number}] Critical error calling forward_to_base_account for {dest}: {e}")
+                    results.append({"type": "onchain", "dest": dest, "ok": False, "error": f"Critical: {str(e)}"})
                     failed_forwards += 1
-                    results.append({"dest": dest, "ok": False, "error": res.get("error")})
-                    failed_details.append(f"{dest}:{res.get('error')}")
-        else:
-            # If there are onchain destinations but transfer not enabled, skip onchain sends.
-            if onchain_dests and not onchain_transfer_enabled:
-                logging.info(f"[{self.phone_number}] Found onchain destinations but onchain_transfer not enabled; skipping onchain sends.")
+                    failed_details.append(("onchain", dest, f"Critical: {str(e)}"))
+        elif onchain_dests and not (onchain_transfer_enabled and onchain_amount > 0):
+             logging.info(f"[{self.phone_number}] Skipping onchain sends for Job '{job.get('job_name', 'Unnamed')}' - transfer not enabled or amount is zero.")
 
-        # Log if many failed
+
+        # --- Final Logging & Update ---
+        total_destinations = len(destination_ids if destination_ids != ['hyperliquid_account'] else []) + len(trader_endpoints) + len(onchain_dests if onchain_transfer_enabled and onchain_amount > 0 else [])
+
         if failed_forwards > 0:
-            logging.error(f"[{self.phone_number}] ❌ Failed to forward to {failed_forwards} destinations: {', '.join(failed_details)}")
+            err_summary = ", ".join([f"{dtype} {dest[:20]}.. ({err[:30]}..)" for dtype, dest, err in failed_details])
+            logging.error(f"[{self.phone_number}] ❌ Job '{job.get('job_name', 'Unnamed')}' - Failed forwards: {failed_forwards}/{total_destinations}. Errors: {err_summary}")
 
-        # Update forward time only if at least one destination succeeded
         if successful_forwards > 0:
             self._update_forward_time(key, job['type'])
+            logging.info(f"[{self.phone_number}] ✅ Job '{job.get('job_name', 'Unnamed')}' - Successful forwards: {successful_forwards}/{total_destinations}.")
+        elif total_destinations > 0 : # Only log if there were destinations to attempt
+             logging.warning(f"[{self.phone_number}] ⚠️ Job '{job.get('job_name', 'Unnamed')}' - No successful forwards out of {total_destinations} destinations attempted.")
+
 
         return {
-            'total': len(destination_ids) + len(onchain_dests),
+            'total': total_destinations,
             'successful': successful_forwards,
             'failed': failed_forwards,
-            'results': results
+            'results': results # Return the detailed list
         }
 
     def _can_forward(self, key, type, timer):
@@ -3798,13 +3860,22 @@ class TelegramBot:
         elif state == "job_destinations":
             prompt = (f"{extra_info}\n\n"
                       "📤 **Set Destination**\n\n"
-                      "Send the destination chat(s) (e.g., `@username, My Channel`).\n\n"
-                      "Alternatively, press the button below to use your connected **Hyperliquid Account** as the destination to automatically place trades.")
-
-            # Add the new button to the standard step keyboard
-            hyperliquid_button = [Button.text("🏦 Use Hyperliquid Account", resize=True)]
-            base_wallet_button = [Button.text("🪙 Use Base Wallet Source", resize=True)]
-            buttons = [hyperliquid_button, base_wallet_button] + step_keyboard
+                      "Send the destination chat(s) (e.g., `@username`), or use a special keyword for automated actions:\n\n"
+                      "• `base_buy_trigger` - To start an interactive buy on your linked Base wallet.\n"
+                      "• `hyperliquid_account` - To place trades on your linked Hyperliquid account.")
+            
+            buttons = [
+                [Button.text("🏦 Use Hyperliquid Account", resize=True)],
+                [Button.text("🪙 Use Base Wallet Source", resize=True)],
+                [Button.text("⬅️ Back", resize=True), Button.text("❌ Cancel", resize=True)]
+            ]
+            
+        elif state == "awaiting_buy_amount":
+            token_address = session.temp_data.get('buy_flow_token_address', 'Unknown Token')
+            job_name = session.temp_data.get('buy_flow_job_name', 'your job')
+            prompt = (f"📈 Your job '{job_name}' triggered a buy for token:\n`{token_address}`\n\n"
+                      "How much **ETH** would you like to spend to buy this token?\n\n(e.g., `0.01`)")
+            buttons = [[Button.text("❌ Cancel", resize=True)]]
 
         elif state == "job_keywords":
             prompt = (f"{extra_info}\n\n🔤 Send keywords (comma-separated), or 'none' for all.")
@@ -3828,6 +3899,49 @@ class TelegramBot:
         elif state == "awaiting_redeem_code":
             prompt = "🎁 Please send me the code you wish to redeem."
             buttons = [[Button.text("❌ Cancel", resize=True)]]
+            
+        # --- NEW: Resolve name prompt ---
+        elif state == "awaiting_resolve_name":
+            prompt = (f"{extra_info}\n\n"
+                      "🔎 **Resolve a .base name**\n\n"
+                      "Send the `.base` name you want to resolve (for example: `alice.base`), or paste a 0x address to validate.\n\n"
+                      "When I receive the name I'll attempt to resolve it and return the wallet address.")
+            buttons = step_keyboard
+
+        # --- NEW: Register name prompt ---
+        elif state == "awaiting_register_name":
+            prompt = (f"{extra_info}\n\n"
+                      "🆔 **Register a .base name**\n\n"
+                      "Send a desired basename (e.g. `alice`). I will attempt to reserve/register it for you.\n\n"
+                      "Type `cancel` to abort.")
+            buttons = step_keyboard
+
+        # --- NEW: Payment amount prompt (simple interactive payments) ---
+        elif state == "awaiting_payment_amount":
+            prompt = (f"{extra_info}\n\n"
+                      "💳 **Start a Payment**\n\n"
+                      "Please enter the amount in USD you want to pay (e.g. `5.00`).\n\n"
+                      "You can also type `cancel` to abort.")
+            buttons = step_keyboard
+                
+        elif state == "job_awaiting_source_wallet_address" or state == "job_source_base_wallet":
+             prompt = (f"{extra_info}\n\n"
+                       "🪙 **Set Source Wallet**\n\n"
+                       "Please send the public Base wallet address (0x...) or the `.base` name you want to track as the source for this job.")
+             # Use standard step keyboard allowing back/cancel
+             buttons = step_keyboard
+             
+        elif state == "awaiting_base_private_key":
+            prompt = ("""🔐 **Link Private Key for Automated Buys**
+
+⚠️ **SECURITY WARNING:** You are about to provide a wallet's private key. This is required for the bot to execute buy transactions on your behalf.
+
+- This key will be **encrypted** and stored securely.
+- **NEVER** use your main wallet. Create a new, separate wallet ("burner wallet") specifically for this bot.
+- Only fund this wallet with amounts you are comfortable with for automated trading.
+
+Please send the **private key** for your trading wallet. This message will be deleted for your security.""")
+            buttons = step_keyboard
 
         # States that show their own full-screen menus are handled here
         elif state in ["job_management", "other_settings_menu", "job_awaiting_match_logic", "deleting_job", "modifying_job"]:
@@ -4436,7 +4550,24 @@ class TelegramBot:
         # 2. Add handlers for the new commands
         @self.bot.on(events.NewMessage(pattern='/subscribe'))
         async def subscribe_command(event):
-            await self.handle_subscribe_command(event)
+            """Handles the /subscribe command by showing payment options."""
+            if not SUBSCRIPTION_ENABLED:
+                await event.reply("Subscriptions are currently disabled by the administrator.")
+                return
+
+            message = (
+                "🚀 **Upgrade to Premium**\n\n"
+                "Unlock the full power of the bot with a premium subscription. Choose your preferred payment method below."
+            )
+
+            buttons = [
+                [Button.inline("💳 Pay with Card/Bank (Paystack)", data="subscribe_card")],
+                [Button.inline("₿ Pay with Crypto (NOWPayments)", data="subscribe_crypto")],
+                # --- ADD THIS LINE ---
+                [Button.inline("🔷 Pay with Coinbase", data="subscribe_coinbase")]
+            ]
+
+            await event.reply(message, buttons=buttons)
 
         @self.bot.on(events.NewMessage(pattern='/referral'))
         async def referral_command(event):
@@ -4556,6 +4687,53 @@ class TelegramBot:
                 await event.edit(f"Please send `{pay_amount}` {pay_currency} to the following address:\n\n`{payment_address}`\n\n**Note:** This invoice will be valid for a limited time.")
             except requests.exceptions.RequestException as e:
                 await event.answer(f"Error creating invoice: {e}", alert=True)
+
+        # --- ADD THIS ENTIRE NEW METHOD ---
+        @self.bot.on(events.CallbackQuery(pattern=b'subscribe_coinbase'))
+        async def on_subscribe_coinbase(event):
+            """Handles the 'Pay with Coinbase' button click, showing plan options."""
+            buttons = [
+                [Button.inline(f"${PRICES['monthly_usd']}/Month via Coinbase", data=f"pay_coinbase_{PRICES['monthly_usd']}")],
+                [Button.inline(f"${PRICES['yearly_usd']}/Year via Coinbase", data=f"pay_coinbase_{PRICES['yearly_usd']}")],
+            ]
+            await event.edit("Choose your subscription plan:", buttons=buttons)
+
+        # --- ADD THIS ENTIRE NEW METHOD ---
+        @self.bot.on(events.CallbackQuery(pattern=re.compile(b"pay_coinbase_(\d+\.?\d*)")))
+        async def on_pay_coinbase(event):
+            """Handles the Coinbase plan selection and generates a payment link."""
+            try:
+                amount = float(event.pattern_match.group(1).decode('utf-8'))
+                user_id = event.sender_id
+
+                await event.answer("⏳ Generating Coinbase Commerce link...")
+
+                # We can reuse the existing coinbase_create_checkout function!
+                # It's synchronous, so we run it in an executor to avoid blocking the bot.
+                loop = asyncio.get_running_loop()
+                # The 'db_conn' argument is ignored by the file-based version, so we can pass None.
+                result = await loop.run_in_executor(
+                    None, coinbase_create_checkout, None, user_id, amount, "USDC", "base", None
+                )
+
+                if result and result.get("ok"):
+                    charge = result.get("charge", {})
+                    hosted_url = charge.get("hosted_url")
+                    if hosted_url:
+                        await event.edit(
+                            "Please complete your payment on the secure Coinbase Commerce page:",
+                            buttons=[[Button.url("Pay Now", hosted_url)]]
+                        )
+                    else:
+                        await event.answer("❌ Error: Could not retrieve payment URL from Coinbase.", alert=True)
+                else:
+                    error_message = result.get("error", "Unknown error")
+                    logging.error(f"Failed to create Coinbase charge for user {user_id}: {error_message}")
+                    await event.answer(f"❌ Error creating payment link: {error_message}", alert=True)
+
+            except Exception as e:
+                logging.error(f"Error in on_pay_coinbase handler: {e}", exc_info=True)
+                await event.answer("❌ A critical error occurred. Please try again.", alert=True)
 
         @self.bot.on(events.CallbackQuery(pattern=b'request_payout'))
         async def on_request_payout(event):
@@ -5132,6 +5310,9 @@ class TelegramBot:
 
         elif state == "demo_awaiting_code":
             await self.handle_demo_code(event, message)
+            
+        elif state == "awaiting_third_party_track":
+            await self.handle_awaiting_third_party_wallet(event, message)
 
         elif state == "awaiting_api_id":
             await self.handle_api_id(event, message)
@@ -5187,6 +5368,15 @@ class TelegramBot:
 
         elif state == "awaiting_pattern_save_name":
             await self.handle_pattern_save_name(event, message)
+            
+        elif state == "awaiting_base_private_key":
+            await self.handle_awaiting_base_private_key(event, message)
+
+        elif state == "awaiting_buy_amount":
+            await self.handle_awaiting_buy_amount(event, message)
+            
+        elif state == "awaiting_resolve_name":
+            await self.handle_awaiting_resolve_name(event, message)
 
         # NEW STATE HANDLER ADDED
         elif state == "awaiting_job_name":
@@ -5806,19 +5996,23 @@ class TelegramBot:
             ]
         #
         await event.reply(menu_text, buttons=buttons)
-        
+
     async def show_base_menu(self, event):
         """
-        Display Base submenu as text-buttons (reuses same Button.text style).
-        This sets session.state to 'base_menu' so handle_base_menu can pick up choices.
+        Display Base submenu with an option to link a private key for trading.
         """
         session = await self.get_user_session(event.sender_id)
         session.set_state("base_menu")
 
-        menu_text = "🔷 **Base Menu**\n\nQuick actions for Base / Basenames / Wallets:"
+        user_data = await self.load_user_data(event.sender_id)
+        pk_linked = "✅ Linked" if user_data.get('base_wallet_private_key_encrypted') else "❌ Not Linked"
+
+        menu_text = f"🔷 **Base Menu**\n\nYour wallet for automated buys is: **{pk_linked}**"
         buttons = [
-            [Button.text("🔗 Link Wallet", resize=True), Button.text("👤 My Wallet", resize=True)],
+            [Button.text("🔗 Link Public Address", resize=True), Button.text("👤 My Public Address", resize=True)],
+            [Button.text("🔐 Link Private Key for Buys", resize=True)],
             [Button.text("🔎 Resolve Name", resize=True), Button.text("🆔 Register Name", resize=True)],
+            [Button.text("➕ Track Third-Party Wallet", resize=True)],
             [Button.text("💳 Payments", resize=True), Button.text("🔙 Back to Main Menu", resize=True)]
         ]
         await event.reply(menu_text, buttons=buttons)
@@ -5834,66 +6028,77 @@ class TelegramBot:
         - Back to Main Menu -> calls send_main_menu
         """
         user_id = event.sender_id
-        # Link Wallet
-        if "Link Wallet" in message or "🔗 Link Wallet" in message:
-            await event.reply("Creating wallet link challenge...")
+        session = await self.get_user_session(user_id)
+
+        # Link public address (challenge)
+        if "Link Public Address" in message:
+            await event.reply("Creating public address link challenge.")
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 msg = await loop.run_in_executor(None, create_link_challenge, user_id)
-                help_text = (
-                    "Sign the message with your wallet (MetaMask/Wallet) using personal_sign.\n\n"
-                    "After signing, send:\n"
-                    "`/confirm_link <address?> <signature>`\n\n"
-                    "Example signature-only: `/confirm_link 0x2c64...`"
-                )
-                await event.reply(f"Challenge message (sign exactly):\n\n```\n{msg}\n```\n\n{help_text}")
+                help_text = "Sign this message with your wallet, then send:\n`/confirm_link <your_address> <signature>`"
+                await event.reply(f"Challenge Message:\n\n```\n{msg}\n```\n\n{help_text}")
             except Exception as e:
+                logging.exception("create_link_challenge error")
                 await event.reply(f"Failed to create challenge: {e}")
+            return
 
-        # My Wallet
-        elif "My Wallet" in message or "👤 My Wallet" in message:
-            await event.reply("Checking linked wallet...")
+        # Show linked public address
+        if "My Public Address" in message:
+            await event.reply("Checking linked public address.")
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 addr = await loop.run_in_executor(None, get_user_linked_address, user_id)
                 if addr:
-                    await event.reply(f"Your linked wallet: `{addr}`")
+                    await event.reply(f"Your linked public address: `{addr}`")
                 else:
-                    await event.reply("You do not have a linked wallet. Use `Link Wallet` to start.")
+                    await event.reply("You do not have a linked public address.")
             except Exception as e:
-                await event.reply(f"Error reading linked wallet: {e}")
+                logging.exception("get_user_linked_address error")
+                await event.reply(f"Error reading linked address: {e}")
+            return
+
+        # Link private key flow
+        if "Link Private Key for Buys" in message:
+            session.set_state("awaiting_base_private_key")
+            await self.show_prompt_for_state(event, "awaiting_base_private_key")
+            return
+
+        # Track third-party wallet (watch-only simpler flow)
+        if "Track Third-Party Wallet" in message or "➕ Track Third-Party Wallet" in message:
+            session.set_state("awaiting_third_party_wallet")
+            # job_source_base_wallet prompt also works for tracked sources; reuse
+            await self.show_prompt_for_state(event, "job_awaiting_source_wallet_address", extra_info="Send the wallet address you want to add as a tracked source (0x...) or a basename (alice.base).")
+            return
 
         # Resolve Name
-        elif "Resolve Name" in message or "🔎 Resolve Name" in message:
-            session = await self.get_user_session(user_id)
+        if "Resolve Name" in message or "🔎 Resolve Name" in message:
             session.set_state("awaiting_resolve_name")
             await self.show_prompt_for_state(event, "awaiting_resolve_name")
+            return
 
         # Register Name
-        elif "Register Name" in message or "🆔 Register Name" in message:
-            session = await self.get_user_session(user_id)
+        if "Register Name" in message or "🆔 Register Name" in message:
             session.set_state("awaiting_register_name")
             await self.show_prompt_for_state(event, "awaiting_register_name")
+            return
 
         # Payments
-        elif "Payments" in message or "💳 Payments" in message:
-            # If you have an interactive payment prompt state, use it. Else instruct user.
+        if "Payments" in message or "💳 Payments" in message:
             try:
-                # attempt to reuse an existing prompt handler if available
-                session = await self.get_user_session(user_id)
                 session.set_state("awaiting_payment_amount")
                 await self.show_prompt_for_state(event, "awaiting_payment_amount")
             except Exception:
                 await event.reply("To start a payment, send: `/pay <amount_usd>` (e.g. `/pay 5.00`).")
+            return
 
         # Back to Main Menu
-        elif "Back to Main Menu" in message or "🔙 Back to Main Menu" in message:
+        if "Back to Main Menu" in message or "🔙 Back to Main Menu" in message:
             await self.send_main_menu(event)
+            return
 
-        else:
-            await event.reply("Please use one of the Base submenu buttons.")
+        # Fallback
+        await event.reply("Please use one of the Base submenu buttons.")
 
 
     # REPLACED based on fixed_disconnect_logic.txt
@@ -5942,8 +6147,9 @@ class TelegramBot:
             # We don't need a separate handler for the button click,
             # we can just show the subscription options directly.
             buttons = [
-                [Button.inline("Pay with Card/Bank", data="subscribe_card")],
-                [Button.inline("Pay with Crypto", data="subscribe_crypto")]
+                [Button.inline("💳 Pay with Card/Bank (Paystack)", data="subscribe_card")],
+                [Button.inline("₿ Pay with Crypto (NOWPayments)", data="subscribe_crypto")],
+                [Button.inline("🔷 Pay with Coinbase", data="subscribe_coinbase")]  # <<-- added Coinbase option
             ]
             await event.reply("How would you like to subscribe?", buttons=buttons)
 
@@ -6739,6 +6945,7 @@ Send the number (1-5) or type the job type name.""")
         Handles all steps of the job creation process after the type has been selected.
         This is a state machine that guides the user through providing sources,
         destinations, keywords, etc., with full back/cancel and permission enforcement.
+        (Version includes destination testing logic and corrected state transitions)
         """
         user_id = event.sender_id
         session = await self.get_user_session(user_id)
@@ -6747,7 +6954,7 @@ Send the number (1-5) or type the job type name.""")
         # Safety check: A forwarder must exist to create a job.
         if not forwarder:
             await event.reply("❌ Your account is not properly connected. Please use /start to reconnect.")
-            session.state = "idle" # Reset state
+            session.state = "idle"
             return
 
         state = session.state
@@ -6760,441 +6967,391 @@ Send the number (1-5) or type the job type name.""")
                     await event.reply("❌ Please provide at least one source chat.")
                     return
 
-                # --- RESTORED LOGIC: Permission Check for Source Count ---
+                # --- Permission Check for Source Count ---
                 permission, msg = await self.check_permission(user_id, 'add_source', context={'source_count': len(sources)})
                 if not permission:
                     await event.reply(f"🔒 {msg}")
                     await self.show_prompt_for_state(event, "job_sources", extra_info="Please enter a new list of sources that meets your plan's limits.")
                     return
-                # --- END OF RESTORED LOGIC ---
+                # --- END OF LOGIC ---
 
                 await event.reply("🔍 Verifying source chats...")
                 source_details = [await forwarder._get_entity_details(s) for s in sources]
-
+                
                 session.pending_job['source_ids'] = [d[0] for d in source_details]
                 source_names = [d[1] for d in source_details]
-
+                
                 session.set_state("job_destinations")
                 await self.show_prompt_for_state(event, "job_destinations", extra_info=f"Sources set: {', '.join(source_names)}")
 
             # --- State 2: Awaiting Destination Chats ---
             elif state == "job_destinations":
-                dest_names = []
+                job_type = session.pending_job.get('type')
+                next_state = "job_timer" # Default next step
+                dest_names_str = ""
 
-                # --- NEW LOGIC: Check if the Hyperliquid button was pressed ---
+                # --- Handle Button Clicks or Text Input ---
                 if message == "🏦 Use Hyperliquid Account":
                     user_data = await self.load_user_data(user_id)
                     if not user_data.get('hl_api_key'):
-                        await event.reply("❌ You must connect your Hyperliquid account first. Please go to 'Other Settings' -> 'Manage Hyperliquid' to connect.")
-                        return # Stay in the same state
-
+                        await event.reply("❌ You must connect your Hyperliquid account first. Go to 'Other Settings' -> 'Manage Hyperliquid'.")
+                        return # Stay in state
+                    
                     # Use a special identifier for the Hyperliquid destination
                     session.pending_job['destination_ids'] = ['hyperliquid_account']
-                    dest_names = ["Hyperliquid Account"]
-                    
-                # New: onchain / Base destination button
-                if message == "🪙 Use Base Onchain Destination":
-                    session.pending_job['onchain_destinations'] = []
-                    session.set_state("job_onchain_destinations")
-                    await self.show_prompt_for_state(event, "job_onchain_destinations", extra_info="Send one or more destinations (comma-separated). Use `.base` names or 0x addresses. Set amount later.")
-                    return
+                    dest_names_str = "Hyperliquid Account"
 
+                elif message == "🪙 Use Base Wallet Source": # Corrected state transition
+                    # Set state to begin the wallet SOURCE verification flow
+                    session.set_state("job_source_base_wallet")
+                    # Show the prompt asking the user for their wallet address/name
+                    await self.show_prompt_for_state(event, "job_source_base_wallet", extra_info="Please provide the Base wallet address or .base name to use as the source.")
+                    return # Exit to wait for the wallet address input
 
-                # --- EXISTING LOGIC: Handle regular Telegram chat IDs ---
-                else:
+                else: # Handle regular text input (Chat Names)
                     destinations = [d.strip() for d in message.split(',') if d.strip()]
                     if not destinations:
-                        await event.reply("❌ Please provide at least one destination chat or use the button.")
+                        await event.reply("❌ Please provide at least one destination chat or use a button.")
                         return
-
+                        
                     permission, msg = await self.check_permission(user_id, 'add_destination', context={'destination_count': len(destinations)})
                     if not permission:
                         await event.reply(f"🔒 {msg}")
-                        await self.show_prompt_for_state(event, "job_destinations", extra_info="Please enter a new list of destinations that meets your plan's limits.")
+                        await self.show_prompt_for_state(event, "job_destinations", extra_info="Please enter a new list of destinations.")
                         return
-
+                        
                     await event.reply("🔍 Verifying destination chats...")
                     dest_details = [await forwarder._get_entity_details(d) for d in destinations]
-
+                    
                     session.pending_job['destination_ids'] = [d[0] for d in dest_details]
-                    dest_names = [d[1] for d in dest_details]
+                    dest_names_str = ', '.join([d[1] for d in dest_details])
 
-                # --- UNIFIED LOGIC: Proceed to the next step ---
-                job_type = session.pending_job.get('type')
-
-                # We no longer test destinations if Hyperliquid is selected, as there's nothing to test.
-                # A proper connection test will happen during the trade execution itself.
+                # --- Determine Correct Next Step ---
                 if 'hyperliquid_account' in session.pending_job.get('destination_ids', []):
-                     # For Hyperliquid, we skip directly to the timer/final step for most job types
-                     next_state_map = {
-                         'keywords': "job_keywords",
-                         'cashtags': "job_cashtags",
-                         'custom_pattern': "job_custom_pattern_menu"
-                     }
-                     next_state = next_state_map.get(job_type, "job_timer")
-
-                else: # This is the original logic for Telegram destinations
-                    next_state = "job_timer"
+                    next_state = {'keywords': "job_keywords", 'cashtags': "job_cashtags", 'custom_pattern': "job_custom_pattern_menu"}.get(job_type, "job_timer")
+                else: # Regular destinations
                     if job_type == 'keywords': next_state = "job_keywords"
                     elif job_type == 'cashtags': next_state = "job_cashtags"
+                    elif job_type == 'custom_pattern': next_state = "job_custom_pattern_menu"
+                    # else default "job_timer" remains
 
-                if job_type == 'custom_pattern':
+                # --- Transition ---
+                session.set_state(next_state)
+                if next_state == "job_custom_pattern_menu":
                     session.pending_job['patterns'] = []
-                    session.set_state("job_custom_pattern_menu")
                     await self.handle_custom_pattern_menu(event, "init")
+                else:
+                    await self.show_prompt_for_state(event, next_state, extra_info=f"Destinations set: {dest_names_str}")
+                    
+            # --- NEW State: Awaiting Source Wallet Address (No Verification) ---
+            elif state == "job_awaiting_source_wallet_address" or state == "job_source_base_wallet":
+                source_address_input = message.strip()
+                if not source_address_input:
+                    await event.reply("❌ Please send a valid Base wallet address (0x...) or a `.base` name.")
+                    return # Stay in state
+
+                resolved_address = source_address_input
+                is_valid_format = False
+
+                # Attempt to resolve if it's a .base name
+                if resolved_address.lower().endswith(".base"):
+                    await event.reply(f"🔍 Resolving `{resolved_address}`...")
+                    try:
+                        # Ensure resolve_basename is imported or globally accessible
+                        # Run blocking function in executor to avoid blocking asyncio loop
+                        loop = asyncio.get_running_loop()
+                        resolved = await loop.run_in_executor(None, resolve_basename, resolved_address)
+                        if not resolved:
+                            await event.reply(f"❌ Could not resolve `{resolved_address}`. Please check the name or provide the 0x address directly.")
+                            return # Stay in state
+                        resolved_address = resolved
+                        is_valid_format = True # Resolved address is assumed valid format
+                    except Exception as e:
+                        logging.error(f"Error resolving basename {resolved_address}: {e}")
+                        await event.reply(f"❌ An error occurred while resolving the name: {e}")
+                        return # Stay in state
+                
+                # Basic validation for 0x format (can be enhanced)
+                if resolved_address.startswith("0x") and len(resolved_address) == 42:
+                     try:
+                         # Optional: Use web3 checksumming if available
+                         from web3 import Web3
+                         resolved_address = Web3.toChecksumAddress(resolved_address)
+                         is_valid_format = True
+                     except ImportError:
+                         is_valid_format = True # Assume valid if web3 not available for checksum
+                     except Exception: # Checksum failed
+                          is_valid_format = False
+                elif not resolved_address.lower().endswith(".base"): # If it wasn't a .base name initially
+                    is_valid_format = False
+
+
+                if not is_valid_format:
+                    await event.reply("❌ Invalid address format. Please provide a valid 0x address or a `.base` name.")
+                    return # Stay in state
+
+                # Add the wallet for tracking using the existing helper function
+                # Run blocking function in executor
+                loop = asyncio.get_running_loop()
+                add_res = await loop.run_in_executor(None, add_tracked_base_wallet, user_id, resolved_address)
+
+                if not add_res.get("ok") and "already tracked" not in add_res.get("error", "").lower():
+                    # Handle failure to add tracking (e.g., disk error)
+                    await event.reply(f"❌ Error setting up tracking for wallet: {add_res.get('error')}")
+                    # Decide if you want to abort job creation or just warn
+                    # For now, let's abort by returning to source selection
+                    session.set_state("job_sources")
+                    await self.show_prompt_for_state(event, "job_sources", extra_info="⚠️ Error tracking wallet. Please select sources again.")
                     return
+
+                # Store the tracked wallet in the pending job data
+                pj = session.pending_job
+                pj.setdefault("tracked_wallets", [])
+                if resolved_address not in pj["tracked_wallets"]: # Avoid duplicates in job spec
+                    pj["tracked_wallets"].append(resolved_address)
+                pj["trigger_on_tracked_wallet"] = True # Mark this job as triggered by wallet events
+
+                # Wallet source is set, proceed to setting DESTINATIONS
+                session.set_state("job_destinations")
+                await self.show_prompt_for_state(event, "job_destinations", extra_info=f"✅ Source Wallet Set: `{resolved_address}` (Tracking Active). Now set destinations.")
+
+            # --- State 3: Awaiting Onchain Destinations ---
+            elif state == "job_onchain_destinations":
+                # Parse comma-separated addresses or basenames
+                parts = [p.strip() for p in message.split(",") if p.strip()]
+                if not parts:
+                    await event.reply("Please provide at least one destination.")
+                    return
+                    
+                # Resolve basenames if needed    
+                resolved = []
+                for p in parts:
+                    if p.lower().endswith(".base"):
+                        addr = resolve_basename(p) # Assuming resolve_basename is globally accessible or imported
+                        if not addr:
+                            await event.reply(f"❌ Could not resolve `{p}`.")
+                            return
+                        resolved.append(addr)
+                    else: # Assume 0x address or handle error later
+                        resolved.append(p)
+                # Store        
+                session.pending_job["onchain_destinations"] = resolved
+                # After setting onchain destinations, proceed to timer or other steps
+                job_type = session.pending_job.get('type')
+                next_state = "job_timer" # Default next step after destinations
+                if job_type == 'keywords': next_state = "job_keywords"
+                elif job_type == 'cashtags': next_state = "job_cashtags"
+                elif job_type == 'custom_pattern': next_state = "job_custom_pattern_menu"
 
                 session.set_state(next_state)
-                await self.show_prompt_for_state(event, next_state, extra_info=f"Destinations set: {', '.join(dest_names)}")
-                
-                # -----------------------------------------------------------
-                # NEW STATE HANDLER: Onchain destinations entry
-                # -----------------------------------------------------------
-                if state == "job_onchain_destinations":
-                    # Parse comma-separated addresses or basenames
-                    parts = [p.strip() for p in message.split(",") if p.strip()]
-                    if not parts:
-                        await event.reply("Please provide at least one destination.")
-                        return
+                if next_state == "job_custom_pattern_menu":
+                     session.pending_job['patterns'] = []
+                     await self.handle_custom_pattern_menu(event, "init")
+                else:
+                    await self.show_prompt_for_state(event, next_state, extra_info=f"Onchain Destinations set: {', '.join(resolved)}")
 
-                    # Resolve basenames if needed
-                    resolved = []
-                    for p in parts:
-                        if p.lower().endswith(".base"):
-                            addr = resolve_basename(p)
-                            if not addr:
-                                await event.reply(f"❌ Could not resolve `{p}` — please check spelling or try a different `.base` name.")
-                                return
-                            resolved.append(addr)
-                        else:
-                            resolved.append(p)
 
-                    # Store
-                    session.pending_job.setdefault("onchain_destinations", [])
-                    session.pending_job["onchain_destinations"] = resolved
-
-                    # Proceed to next step: choose amount or continue normal job flow
-                    session.set_state("job_timer")  # ← safest universal next step
-                    await self.show_prompt_for_state(event, "job_timer")
+            # --- State 4: Awaiting Base Wallet Source (Challenge) ---
+            elif state == "job_source_base_wallet":
+                target_addr = message.strip()
+                if not target_addr:
+                    await event.reply("Please send a wallet address (0x...) or a `.base` name.")
                     return
                     
-                # -----------------------------------------------------------
-                # STATE: job_source_base_wallet  (now creates a challenge and asks to sign)
-                # -----------------------------------------------------------
-                if state == "job_source_base_wallet":
-                    user_id = event.sender_id
-                    text_in = message.strip()
-                    if not text_in:
-                        await event.reply("Please send a wallet address (0x...) or a `.base` name (e.g. alice.base).")
+                # 1) Resolve basename if provided    
+                if target_addr.lower().endswith(".base"):
+                    resolved = resolve_basename(target_addr) # Assuming resolve_basename exists
+                    if not resolved:
+                        await event.reply(f"❌ Could not resolve `{target_addr}`.")
                         return
+                    target_addr = resolved
 
-                    # 1) Resolve basename if provided
-                    target_addr = text_in
-                    try:
-                        if text_in.lower().endswith(".base"):
-                            resolved = resolve_basename(text_in)
-                            if not resolved:
-                                await event.reply(f"❌ Could not resolve `{text_in}`. Please check the name or try a direct 0x address.")
-                                return
-                            target_addr = resolved
-                    except Exception as e:
-                        await event.reply(f"Error resolving basename: {e}")
-                        return
+                # Ensure create_link_challenge is globally accessible or imported
+                loop = asyncio.get_running_loop()
+                challenge = await loop.run_in_executor(None, create_link_challenge, user_id)
 
-                    # 2) Normalize/check address (best-effort)
-                    try:
-                        from web3 import Web3
-                        if isinstance(target_addr, str) and target_addr.startswith("0x") and len(target_addr) == 42:
-                            try:
-                                target_addr = Web3.toChecksumAddress(target_addr)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                    # 3) Create a challenge for the user to sign (reuse global helper if exists)
-                    try:
-                        # try to reuse existing create_link_challenge(user_id) helper (thread-safe)
-                        try:
-                            ch = await run_blocking(create_link_challenge, user_id)
-                        except TypeError:
-                            # some create_link_challenge implementations may not accept user_id; fallback
-                            ch = await run_blocking(create_link_challenge)
-                    except Exception:
-                        # As a fallback, generate a short challenge locally
-                        import secrets, time
-                        ch = f"Verify ownership for job wallet at {int(time.time())}-{secrets.token_hex(4)}"
-
-                    # 4) Store challenge and target address in the pending job with timestamp
-                    import time
-                    session.pending_job['wallet_to_verify'] = target_addr
-                    session.pending_job['wallet_challenge'] = ch
-                    session.pending_job['wallet_challenge_ts'] = int(time.time())
-
-                    # 5) Move to signature-waiting state
-                    session.set_state("awaiting_job_wallet_signature")
-
-                    help_text = (
-                        "Please sign the following message with the wallet you are linking (personal_sign / eth_sign).\n\n"
-                        "Then paste the signature text here. You may optionally prepend the address: `0xYourAddr <signature>`\n\n"
-                        f"Message to sign (exactly):\n```\n{ch}\n```\n\n"
-                        "The challenge expires in 10 minutes."
-                    )
-                    await event.reply(help_text, buttons=Button.clear())
-                    return
-                    
-                # -----------------------------------------------------------
-                # STATE: awaiting_job_wallet_signature
-                # User must paste signature (optionally prefixed by address)
-                # -----------------------------------------------------------
-                if state == "awaiting_job_wallet_signature":
-                    user_id = event.sender_id
-                    raw = message.strip()
-                    if not raw:
-                        await event.reply("Please paste the signature (optionally preceded by the address). Example:\n`0xabc... 0xSIG...`")
-                        return
-
-                    # Load saved challenge and target address
-                    pj = session.pending_job
-                    challenge = pj.get('wallet_challenge')
-                    target_addr = pj.get('wallet_to_verify')
-                    ts = pj.get('wallet_challenge_ts') or 0
-
-                    import time
-                    if not challenge or not target_addr:
-                        await event.reply("No pending wallet verification found. Please restart by sending the wallet again.")
-                        session.set_state("job_source_base_wallet")
-                        return
-
-                    # Check expiry (10 minutes)
-                    if int(time.time()) - int(ts) > 600:
-                        await event.reply("The challenge expired (older than 10 minutes). Please resend the wallet address to generate a new challenge.")
-                        # clear stale challenge
-                        pj.pop('wallet_challenge', None)
-                        pj.pop('wallet_challenge_ts', None)
-                        pj.pop('wallet_to_verify', None)
-                        session.set_state("job_source_base_wallet")
-                        return
-
-                    # Parse input: allow "0xADDR <signature>" or just "<signature>"
-                    sig = None
-                    maybe_addr = None
-                    parts = raw.split()
-                    if len(parts) == 1:
-                        sig = parts[0].strip()
-                    else:
-                        # if first token looks like an address, treat it as address
-                        if parts[0].startswith("0x") and len(parts[0]) == 42:
-                            maybe_addr = parts[0].strip()
-                            sig = " ".join(parts[1:]).strip()
-                        else:
-                            # assume signature only
-                            sig = raw
-
-                    if not sig:
-                        await event.reply("No signature found in your message. Please paste the signature text.")
-                        return
-
-                    # 1) Prefer existing helper verify_wallet_signature(user_id, address, signature)
-                    verified_addr = None
-                    try:
-                        if 'verify_wallet_signature' in globals() and callable(globals().get('verify_wallet_signature')):
-                            # helper may accept (user_id, address, signature) or (address, signature)
-                            try:
-                                ok = await run_blocking(verify_wallet_signature, user_id, target_addr, sig)
-                            except TypeError:
-                                ok = await run_blocking(verify_wallet_signature, target_addr, sig)
-                            if ok:
-                                verified_addr = target_addr
-                        else:
-                            # Fallback to eth_account recovery
-                            try:
-                                from eth_account.messages import encode_defunct
-                                from eth_account import Account
-                                msg = encode_defunct(text=challenge)
-                                # signature may be hex prefixed or not
-                                recovered = Account.recover_message(msg, signature=sig)
-                                # normalize checksum
-                                from web3 import Web3
-                                recovered = Web3.toChecksumAddress(recovered)
-                                # If user provided maybe_addr, check match; otherwise accept recovered
-                                if maybe_addr:
-                                    try:
-                                        maybe_addr = Web3.toChecksumAddress(maybe_addr)
-                                    except Exception:
-                                        pass
-                                    if recovered.lower() != maybe_addr.lower():
-                                        await event.reply("Signature recovered address does not match the address you provided.")
-                                        return
-                                # confirm that recovered matches the target_addr we asked to verify
-                                try:
-                                    target_ck = Web3.toChecksumAddress(target_addr)
-                                except Exception:
-                                    target_ck = target_addr
-                                if recovered.lower() != str(target_ck).lower():
-                                    await event.reply("Signature recovered address does not match the address you requested to verify.")
-                                    return
-                                verified_addr = recovered
-                            except Exception as e:
-                                await event.reply(f"Signature verification failed: {e}")
-                                return
-                    except Exception as e:
-                        await event.reply(f"Verification helper error: {e}")
-                        return
-
-                    if not verified_addr:
-                        await event.reply("Signature did not verify. Please ensure you signed the *exact* challenge message and paste the complete signature. You may also paste `0xAddr <signature>`.")
-                        return
-
-                    # 2) Persist tracked wallet and attach to pending job
-                    try:
-                        res = await run_blocking(add_tracked_base_wallet, user_id, verified_addr)
-                    except Exception as e:
-                        await event.reply(f"Failed to persist tracked wallet: {e}")
-                        return
-
-                    if not res or not res.get("ok"):
-                        # if already tracked, continue
-                        if res and res.get("error") and "already tracked" in str(res.get("error")).lower():
-                            pass
-                        else:
-                            await event.reply(f"Could not track wallet: {res.get('error') if isinstance(res, dict) else res}")
-                            return
-
-                    pj.setdefault("tracked_wallets", [])
-                    if verified_addr not in pj["tracked_wallets"]:
-                        pj["tracked_wallets"].append(verified_addr)
-                    pj["trigger_on_tracked_wallet"] = True
-
-                    # Clean up challenge metadata
-                    pj.pop('wallet_challenge', None)
-                    pj.pop('wallet_challenge_ts', None)
-                    pj.pop('wallet_to_verify', None)
-
-                    # Persist pending_job if supported
-                    try:
-                        await self.save_user_data(user_id, pj)
-                    except Exception:
-                        pass
-
-                # Next: ask for onchain amount (user can skip)
-                session.set_state("job_onchain_amount")
-                await self.show_prompt_for_state(event, "job_onchain_amount")
-                await event.reply(f"✅ Ownership verified and wallet `{verified_addr}` attached to this job.\n\nPlease enter the native amount to send per trigger (or type `skip` to leave it unset).", buttons=Button.clear())
-                return
+                # 4) Store challenge and target address in the pending job with timestamp
+                session.pending_job['wallet_to_verify'] = target_addr
+                session.pending_job['wallet_challenge'] = challenge
+                session.pending_job['wallet_challenge_ts'] = int(time.time())
                 
-                # -----------------------------------------------------------
-                # STATE: job_onchain_amount
-                # Expect user to send a numeric amount (native) or "skip"
-                # -----------------------------------------------------------
-                if state == "job_onchain_amount":
-                    user_id = event.sender_id
-                    txt = message.strip().lower()
+                # 5) Move to signature-waiting state
+                session.set_state("awaiting_job_wallet_signature")
+                help_text = (f"Please sign the following message with your wallet:\n\n```\n{challenge}\n```\n\nThen paste the signature here (optionally prefixed by address: `0xAddr 0xSig`).")
+                await event.reply(help_text)
 
-                    # allow skip
-                    if txt == "" or txt == "skip":
-                        # no onchain amount set — proceed to destinations
-                        session.set_state("job_destinations")
-                        await self.show_prompt_for_state(event, "job_destinations")
-                        await event.reply("No onchain amount set. Proceeding to destination selection.", buttons=Button.clear())
-                        return
+            # --- State 5: Awaiting Wallet Signature ---
+            elif state == "awaiting_job_wallet_signature":
+                raw = message.strip()
+                pj = session.pending_job
+                challenge = pj.get('wallet_challenge')
+                target_addr = pj.get('wallet_to_verify')
+                ts = pj.get('wallet_challenge_ts', 0)
 
-                    # parse numeric amount
-                    try:
-                        amt = float(message.strip())
-                        if amt <= 0:
-                            raise ValueError("amount must be positive")
-                    except Exception:
-                        await event.reply("Please enter a valid positive number (example: `0.0001`) or type `skip` to skip setting an onchain amount.")
-                        return
-
-                    # optional global guard: ONCHAIN_MAX_PER_JOB
-                    try:
-                        import os
-                        max_per_job = float(os.getenv("ONCHAIN_MAX_PER_JOB")) if os.getenv("ONCHAIN_MAX_PER_JOB") else None
-                    except Exception:
-                        max_per_job = None
-
-                    if max_per_job is not None and amt > max_per_job:
-                        await event.reply(f"Amount exceeds ONCHAIN_MAX_PER_JOB ({max_per_job}). Enter a smaller amount or type `skip`.")
-                        return
-
-                    # store amount and enable onchain transfer flag
-                    session.pending_job['onchain_amount'] = float(amt)
-                    session.pending_job['onchain_transfer'] = True
-
-                    # advance to destination selection
-                    session.set_state("job_destinations")
-                    await self.show_prompt_for_state(event, "job_destinations")
-                    await event.reply(f"✅ Onchain amount set to {amt} (native). Now choose where to forward the event (destinations).", buttons=Button.clear())
+                if not challenge or not target_addr or (int(time.time()) - ts) > LINK_CHALLENGE_TTL: # Use configured TTL
+                    await event.reply(f"Challenge expired (older than {LINK_CHALLENGE_TTL // 60} minutes) or not found. Please restart the source selection.")
+                    session.set_state("job_sources") # Go back to selecting source type
+                    await self.show_prompt_for_state(event, "job_sources", extra_info="Please select your source type again.")
                     return
 
+                parts = raw.split()
+                sig = ""
+                maybe_addr = None
+                if len(parts) == 1 and parts[0].lower().startswith("0x") and len(parts[0]) > 120 : # Likely signature only
+                    sig = parts[0]
+                # if first token looks like an address, treat it as address
+                elif len(parts) >= 2 and parts[0].lower().startswith("0x") and len(parts[0]) == 42 and parts[1].lower().startswith("0x"): # Address + Signature
+                    maybe_addr = parts[0]
+                    sig = " ".join(parts[1:]) # Handle signatures with spaces if any
+                else:
+                    await event.reply("Invalid format. Please paste the signature (e.g., `0xSignature...`) or `0xAddress 0xSignature...`")
+                    return
 
+                # Ensure verify_wallet_signature is globally accessible or imported
+                # 1) Prefer existing helper (much smaller than older version)
+                loop = asyncio.get_running_loop()
+                res = await loop.run_in_executor(None, verify_wallet_signature, user_id, maybe_addr or target_addr, sig)
 
-            # --- State 3 (Conditional): Awaiting Keywords ---
+                if not res.get("ok"):
+                    await event.reply(f"❌ Signature did not verify: {res.get('reason')}")
+                    return
+
+                verified_addr = res.get('address')
+                # Ensure add_tracked_base_wallet is globally accessible or imported
+                # 2) Persist tracked wallet and attach to pending job
+                add_res = await loop.run_in_executor(None, add_tracked_base_wallet, user_id, verified_addr)
+
+                if not add_res.get("ok") and "already tracked" not in add_res.get("error", "").lower():
+                     await event.reply(f"Could not track wallet: {add_res.get('error')}")
+                     # Decide if this is fatal or just a warning - for now, continue
+                     # return # If fatal
+
+                pj.setdefault("tracked_wallets", [])
+                if verified_addr not in pj["tracked_wallets"]: # Avoid duplicates
+                    pj["tracked_wallets"].append(verified_addr)
+                pj["trigger_on_tracked_wallet"] = True # Flag this job for wallet triggers
+
+                # Clean up challenge data from pending job
+                pj.pop('wallet_challenge', None); pj.pop('wallet_challenge_ts', None); pj.pop('wallet_to_verify', None)
+
+                # Wallet source is set, now decide next step (e.g., skip keywords, go to destination?)
+                # For now, let's go directly to destination setting for wallet sources.
+                session.set_state("job_destinations")
+                await self.show_prompt_for_state(event, "job_destinations", extra_info=f"✅ Source Wallet Verified: `{verified_addr}`. Now set destinations.")
+
+            # --- State 6: Awaiting Onchain Amount (Now less likely to be hit directly in std flow) ---
+            # This state might be used if modifying an existing job, or if the flow changes. 
+            elif state == "job_onchain_amount":
+                txt = message.strip().lower()
+                
+                # allow skip
+                if txt == "skip":
+                    session.pending_job.pop('onchain_amount', None)
+                    session.pending_job['onchain_transfer'] = False
+                    # Decide next step - likely back to modification menu or finalize
+                    # For now, assume we go back to job management after modification
+                    session.set_state("job_management")
+                    await self.show_job_management(event, session.pagination_page) # Go back to job list
+                    return
+                # parse numeric amount
+                try:
+                    amt = float(message.strip())
+                    if amt <= 0: raise ValueError("Amount must be positive")
+                except ValueError as e:
+                    await event.reply(f"❌ Invalid amount: {e}. Please enter a positive number or `skip`.")
+                    return
+
+                # Optional Max Check (optional global guard: ONCHAIN_MAX_PER_JOB)
+                # max_per_job = float(os.getenv("ONCHAIN_MAX_PER_JOB", 'inf'))
+                # if amt > max_per_job: await event.reply(f"Amount exceeds limit ({max_per_job})."); return
+
+                # store amount and enable onchain transfer flag
+                session.pending_job['onchain_amount'] = amt
+                session.pending_job['onchain_transfer'] = True
+                # Decide next step - likely back to modification menu or finalize
+                session.set_state("job_management") # Assume returning to job list
+                await self.show_job_management(event, session.pagination_page)
+
+            # --- State 7: Awaiting Keywords ---
             elif state == "job_keywords":
                 keywords = [k.strip() for k in message.split(',') if k.strip() and k.lower() != 'none']
-
                 permission, msg = await self.check_permission(user_id, 'add_keywords', context={'keyword_count': len(keywords)})
                 if not permission:
                     await event.reply(f"🔒 {msg}")
-                    await self.show_prompt_for_state(event, "job_keywords", extra_info="⚠️ Please provide a new list of keywords that meets your plan's limits.")
+                    await self.show_prompt_for_state(event, "job_keywords", extra_info="⚠️ Please provide a new list of keywords.")
                     return
-
                 session.pending_job['keywords'] = keywords
-
                 if len(keywords) > 1:
                     session.set_state("job_awaiting_match_logic")
                     await self.ask_for_match_logic(event)
                 else:
-                    session.pending_job['match_logic'] = 'OR'
+                    session.pending_job['match_logic'] = 'OR' # Default for 0 or 1
                     session.set_state("job_timer")
                     await self.show_prompt_for_state(event, "job_timer", extra_info=f"Keywords set: {', '.join(keywords) if keywords else 'All Messages'}")
 
-            # --- State 4 (Conditional): Awaiting Cashtags ---
+            # --- State 8: Awaiting Cashtags ---
             elif state == "job_cashtags":
                 cashtags = [c.strip() for c in message.split(',') if c.strip() and c.lower() != 'none']
-                session.pending_job['cashtags'] = cashtags
+                # Basic validation: ensure they start with $
+                valid_cashtags = [tag for tag in cashtags if tag.startswith('$')]
+                if len(valid_cashtags) != len(cashtags):
+                     await event.reply("⚠️ Some items were not valid cashtags (must start with $). Only valid ones were kept.")
+                if not valid_cashtags and message.lower() != 'none':
+                     await event.reply("❌ No valid cashtags provided. Please ensure they start with $.")
+                     return
 
+                session.pending_job['cashtags'] = valid_cashtags
                 session.set_state("job_timer")
-                await self.show_prompt_for_state(event, "job_timer", extra_info=f"Cashtags set: {', '.join(cashtags) if cashtags else 'All Cashtags'}")
+                await self.show_prompt_for_state(event, "job_timer", extra_info=f"Cashtags set: {', '.join(valid_cashtags) if valid_cashtags else 'All Cashtags'}")
 
-            # --- Final State: Awaiting Timer ---
+            # --- State 9: Awaiting Timer (Includes Destination Test) ---
             elif state == "job_timer":
                 timer_str = message.strip()
-
                 permission, msg = await self.check_permission(user_id, 'set_timer', context={'timer_str': timer_str})
                 if not permission:
                     await event.reply(f"🔒 {msg}")
-                    await self.show_prompt_for_state(event, "job_timer", extra_info="⚠️ Please provide a valid timer that meets your plan's limits.")
+                    await self.show_prompt_for_state(event, "job_timer", extra_info="⚠️ Please provide a valid timer.")
                     return
-
                 session.pending_job['timer'] = '' if timer_str.lower() == 'none' else timer_str
 
-                await event.reply("🧪 **Testing destinations...**")
-                test_results = await forwarder.test_job_destinations(session.pending_job)
-                failed_tests = [r for r in test_results if not r['success']]
+                # --- REINTEGRATED DESTINATION TEST ---
+                should_test_telegram_dest = False
+                if 'hyperliquid_account' not in session.pending_job.get('destination_ids', []) and not session.pending_job.get('onchain_destinations'):
+                     # Only test if there are actual Telegram destination IDs
+                     if session.pending_job.get('destination_ids'):
+                          should_test_telegram_dest = True
 
-                 # Instead of finalizing, we now move to the naming step.
+                if should_test_telegram_dest:
+                    await event.reply("🧪 **Testing Telegram destinations...**")
+                    test_results = await forwarder.test_job_destinations(session.pending_job)
+                    failed_tests = [r for r in test_results if not r.get('success')] # Check key used by test_job_destinations
+
+                    if failed_tests:
+                        session.set_state("job_confirmation")
+                        session.temp_data['test_results'] = test_results
+                        working_chats = [r.get('destination', 'Unknown') for r in test_results if r.get('success')]
+                        failed_details = "\n".join([f"• **{r.get('destination', 'ID '+str(r.get('dest_id')))}**: {r.get('error', 'Unknown error')}" for r in failed_tests])
+                        warning_text = (f"⚠️ **Destination Test Failed**\n\n✅ **Working:** {len(working_chats)}\n❌ **Failed:** {len(failed_tests)}\n{failed_details}\n\nType `proceed` to create job with working destinations, `fix` to re-enter destinations, or `cancel`.")
+                        await event.reply(warning_text)
+                        return # Wait for user response in job_confirmation state
+                    else:
+                        await event.reply("✅ All Telegram destinations seem accessible!")
+                        # Fall through to the next step (naming) if tests pass
+                # --- END REINTEGRATED TEST ---
+
+                # Proceed to naming if tests passed, were skipped, or not applicable
                 session.set_state("awaiting_job_name")
                 await self.show_prompt_for_state(event, "awaiting_job_name", extra_info="✅ Timer set.")
 
-                # Previous Test feature, memed out for now
-                #if failed_tests:
-                    #session.set_state("job_confirmation")
-                    #session.temp_data['test_results'] = test_results
-
-                    #working_chats = [r['destination'] for r in test_results if r['success']]
-                    #failed_details = "\n".join([f"• **{r['destination']}**: {r['error']}" for r in failed_tests])
-                    #warning_text = (f"⚠️ **Destination Test Failed**\n\n✅ **Working:** {len(working_chats)}\n❌ **Failed:** {len(failed_tests)}\n{failed_details}\n\nType `proceed` to create the job with only the working destinations, `fix` to re-enter destinations, or `cancel`.")
-                    #await event.reply(warning_text)
-                #else:
-                    #await event.reply("✅ All destinations are working!")
-                    #await self.finalize_job_creation(event, session, forwarder)
-
+        # --- Error Handling ---
         except ValueError as e:
-            await event.reply(f"❌ Error: {e}\n\nPlease check the spelling and try again.")
-            await self.show_prompt_for_state(event, state)
+            await event.reply(f"❌ Error during job setup: {e}\n\nPlease check your input and try again.")
+            try: await self.show_prompt_for_state(event, state)
+            except Exception: await self.return_to_main_menu(event)
+        except Exception as e:
+            logging.error(f"Unexpected error in handle_job_steps (State: {state}) for user {user_id}: {e}", exc_info=True)
+            await event.reply("❌ An unexpected error occurred during job setup. Please try again or contact support.")
+            await self.return_to_main_menu(event)
 
     # ADDED: New handler for match logic step
     async def ask_for_match_logic(self, event):
@@ -8082,7 +8239,6 @@ If something fails
         elif job['type'] == 'custom_pattern' and job.get('patterns'):
             summary += f"🔍 **Patterns:** `{', '.join(job['patterns'])}`\n"
 
-
         if job.get('timer'):
             summary += f"⏱️ **Cooldown:** {job['timer']}\n"
 
@@ -8094,6 +8250,278 @@ If something fails
         session.temp_data = {}
         await event.reply(summary, buttons=Button.clear())
         await self.send_main_menu(event)
+        
+    async def handle_awaiting_base_private_key(self, event, message):
+        """Processes and securely stores the user's Base wallet private key."""
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+
+        try:
+            await event.delete()
+            private_key = message.strip()
+
+            if not (private_key.startswith("0x") and len(private_key) == 66):
+                await event.reply("❌ Invalid private key format. It should start with '0x' and be 66 characters long. Please try again.")
+                return
+
+            crypto = CryptoManager(user_id)
+            encrypted_key = crypto.encrypt(private_key).decode('utf-8')
+
+            user_data = await self.load_user_data(user_id)
+            user_data['base_wallet_private_key_encrypted'] = encrypted_key
+            await self.save_user_data(user_id, None, direct_data=user_data)
+
+            account = Account.from_key(private_key)
+            await event.reply(f"✅ Private key linked and encrypted successfully for address:\n`{account.address}`")
+            await self.show_base_menu(event)
+
+        except Exception as e:
+            logging.error(f"Failed to process Base private key for user {user_id}: {e}", exc_info=True)
+            await event.reply("❌ An error occurred. Please try again.")
+            await self.show_base_menu(event)
+            
+    async def handle_awaiting_third_party_wallet(self, event, message):
+        """
+        State handler for when a user is prompted to send an address to track
+        (third-party watch-only tracking). This will call your add_tracked_base_wallet helper.
+        """
+        user_id = event.sender_id
+        addr = message.strip()
+        # basic validation
+        if not addr:
+            await event.reply("Please send a wallet address (0x...) or a basename (e.g. alice.base).")
+            return
+
+        await event.reply("Adding tracked wallet...")
+        try:
+            res = await run_blocking(add_tracked_base_wallet, user_id, addr)
+        except Exception as e:
+            await event.reply(f"Failed to track: {e}")
+            # return to menu
+            await self.send_main_menu(event)
+            return
+
+        if res.get("ok"):
+            await event.reply(f"✅ Now tracking {res.get('address')}", buttons=Button.clear())
+        else:
+            await event.reply(f"❌ Failed to track: {res.get('error')}", buttons=Button.clear())
+
+        # return to normal menu
+        await self.send_main_menu(event)
+        
+    # ===== Add / Replace: async def handle_awaiting_resolve_name(self, event, message): =====
+    async def handle_awaiting_resolve_name(self, event, message):
+        """
+        Accepts a `.base` name or 0x address and responds with the resolved address.
+        Uses resolve_basename(name) which already exists elsewhere in your code.
+        """
+        user_id = event.sender_id
+        txt = message.strip()
+        if not txt:
+            await event.reply("Please send the `.base` name (e.g. `alice.base`) or a 0x address.")
+            return
+
+        # Cancel/back handling
+        if txt.lower() in ("cancel", "back"):
+            # restore to base menu
+            session = await self.get_user_session(user_id)
+            session.set_state("base_menu")
+            await self.show_base_menu(event)
+            return
+
+        # If user submitted a .base name, attempt to resolve
+        resolved = None
+        try:
+            loop = asyncio.get_running_loop()
+            if txt.lower().endswith(".base"):
+                # resolve_basename should return 0x... or None on failure
+                resolved = await loop.run_in_executor(None, resolve_basename, txt)
+                if not resolved:
+                    await event.reply(f"❌ Could not resolve `{txt}`. It may not be registered or is invalid.")
+                    return
+                await event.reply(f"✅ `{txt}` resolves to `{resolved}`")
+            else:
+                # If a 0x address, just basic validation and echo back
+                if txt.startswith("0x") and len(txt) in (42, 66):  # basic check (42 for address)
+                    await event.reply(f"Received address: `{txt}`")
+                else:
+                    await event.reply("❌ Invalid input. Send a `.base` name like `alice.base` or a 0x address.")
+                    return
+        except Exception as e:
+            await event.reply(f"❌ Error resolving name: {e}")
+
+        # Return to Base menu after finishing
+        await self.show_base_menu(event)
+    # ===== End add: handle_awaiting_resolve_name =====
+
+
+    async def _initiate_buy_flow(self, user_id, job, token_address, original_message_id):
+        session = await self.get_user_session(user_id)
+        
+        user_data = await self.load_user_data(user_id)
+        if not user_data.get('base_wallet_private_key_encrypted'):
+            await self.bot.send_message(user_id, "⚠️ **Action Required:** Your job triggered a buy, but you haven't linked a private key for your Base wallet. Please go to the '🔷 Base' menu to link one.")
+            return
+
+        if not (token_address and token_address.startswith("0x") and len(token_address) == 42):
+            await self.bot.send_message(user_id, f"⚠️ Your job triggered a buy, but the forwarded content (`{token_address}`) is not a valid token address.")
+            return
+
+        session.temp_data['buy_flow_token_address'] = token_address
+        session.temp_data['buy_flow_job_name'] = job.get('job_name', 'Unnamed Job')
+        session.set_state("awaiting_buy_amount")
+        
+        # We need an event-like object to pass to show_prompt_for_state
+        mock_event = type('Event', (), {'sender_id': user_id, 'reply': lambda text, buttons=None: self.bot.send_message(user_id, text, buttons=buttons)})()
+        await self.show_prompt_for_state(mock_event, "awaiting_buy_amount", extra_info="")
+
+    async def handle_awaiting_buy_amount(self, event, message):
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+
+        try:
+            eth_amount = float(message)
+            if eth_amount <= 0:
+                await event.reply("❌ Amount must be a positive number. Please try again.")
+                return
+        except ValueError:
+            await event.reply("❌ That's not a valid number. Please send the amount of ETH to spend (e.g., `0.01`).")
+            return
+            
+        token_address = session.temp_data.get('buy_flow_token_address')
+        job_name = session.temp_data.get('buy_flow_job_name')
+
+        if not token_address:
+            await event.reply("❌ Critical error: Could not find the token to buy. Aborting.")
+            return await self.return_to_main_menu(event)
+
+        await event.reply(f"🚀 Submitting buy order for **{eth_amount} ETH** worth of token `{token_address[:10]}...`\nThis may take a moment...")
+        
+        swap_result = await execute_onchainkit_swap(user_id, token_address, eth_amount)
+
+        if swap_result.get("ok"):
+            await event.reply(f"✅ **Buy Successful!**\n\n**Job:** {job_name}\n**Spent:** {eth_amount} ETH\n**Token:** `{token_address}`\n\nView Transaction:\n{swap_result['explorer_url']}", link_preview=False)
+        else:
+            await event.reply(f"❌ **Buy Failed!**\n\n**Reason:** `{swap_result.get('error', 'Unknown error')}`")
+
+        session.temp_data.pop('buy_flow_token_address', None)
+        session.temp_data.pop('buy_flow_job_name', None)
+        session.set_state("idle")
+            
+async def execute_onchainkit_swap(user_id: int, token_to_buy_address: str, eth_amount_to_spend: float):
+    """
+    Executes a swap from ETH to a token on Base by calling OnchainKit APIs.
+    """
+    bot_instance = globals().get('bot_instance')
+    if not bot_instance:
+        return {"ok": False, "error": "Bot instance not found."}
+
+    # --- 1. Load User Data & Decrypt Private Key ---
+    try:
+        user_data = await bot_instance.load_user_data(user_id)
+        encrypted_pk = user_data.get('base_wallet_private_key_encrypted')
+        if not encrypted_pk:
+            return {"ok": False, "error": "User has not linked a private key for buys."}
+
+        crypto = CryptoManager(user_id)
+        private_key = crypto.decrypt(encrypted_pk.encode('utf-8'))
+        account = Account.from_key(private_key)
+        user_address = account.address
+        onchainkit_api_key = os.getenv('ONCHAINKIT_API_KEY') # You'll need to set this in your .env
+        if not onchainkit_api_key:
+            return {"ok": False, "error": "ONCHAINKIT_API_KEY is not set on the server."}
+        
+        w3 = connect_base_web3()
+    except Exception as e:
+        return {"ok": False, "error": f"Setup failed: {e}"}
+
+    # --- 2. Get Swap Quote from OnchainKit API ---
+    try:
+        quote_payload = {
+            "amount": str(eth_amount_to_spend),
+            "from": "ETH", # OnchainKit API likely accepts 'ETH' as a symbol
+            "to": token_to_buy_address,
+            "chainId": 8453, # Base Mainnet
+            "fromAddress": user_address,
+        }
+        headers = {"Authorization": f"Bearer {onchainkit_api_key}"}
+        
+        quote_url = f"{ONCHAINKIT_API_BASE_URL}/swap/quote"
+        response = requests.post(quote_url, json=quote_payload, headers=headers)
+        response.raise_for_status()
+        quote_data = response.json()
+
+        if not quote_data or not quote_data.get('quote'):
+             return {"ok": False, "error": f"Failed to get quote: {quote_data.get('error', 'Empty response')}"}
+
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "error": f"API request for quote failed: {e}"}
+
+    # --- 3. Build the Transaction from OnchainKit API ---
+    try:
+        build_payload = {
+            "from": quote_data['quote']['from']['address'] or "0x0000000000000000000000000000000000000000",
+            "to": quote_data['quote']['to']['address'],
+            "amount": quote_data['quote']['fromAmount'],
+            "fromAddress": user_address,
+            "chainId": 8453,
+        }
+
+        build_url = f"{ONCHAINKIT_API_BASE_URL}/swap/build"
+        response = requests.post(build_url, json=build_payload, headers=headers)
+        response.raise_for_status()
+        build_data = response.json()
+
+        if not build_data or not build_data.get('transaction'):
+            return {"ok": False, "error": f"Failed to build transaction: {build_data.get('error', 'Empty response')}"}
+
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "error": f"API request to build transaction failed: {e}"}
+        
+    # --- 4. Sign and Send Transaction(s) ---
+    try:
+        # Check for and execute an approval transaction if required
+        if build_data.get('approveTransaction'):
+            approval_tx_data = build_data['approveTransaction']
+            approval_tx = {
+                'to': w3.toChecksumAddress(approval_tx_data['to']),
+                'from': user_address,
+                'data': approval_tx_data['data'],
+                'nonce': w3.eth.getTransactionCount(user_address),
+                'gasPrice': w3.eth.gas_price,
+                'chainId': 8453
+            }
+            approval_tx['gas'] = w3.eth.estimate_gas(approval_tx)
+            
+            signed_approval = w3.eth.account.sign_transaction(approval_tx, private_key)
+            approval_tx_hash = w3.eth.send_raw_transaction(signed_approval.rawTransaction)
+            await bot_instance.bot.send_message(user_id, f" Approval transaction sent: `{approval_tx_hash.hex()}`. Waiting for confirmation...")
+            w3.eth.wait_for_transaction_receipt(approval_tx_hash)
+
+        # Execute the main swap transaction
+        swap_tx_data = build_data['transaction']
+        main_tx = {
+            'to': w3.toChecksumAddress(swap_tx_data['to']),
+            'from': user_address,
+            'value': int(swap_tx_data.get('value', '0'), 16), # Value is hex
+            'data': swap_tx_data['data'],
+            'nonce': w3.eth.getTransactionCount(user_address),
+            'gasPrice': w3.eth.gas_price,
+            'chainId': 8453
+        }
+        main_tx['gas'] = w3.eth.estimate_gas(main_tx)
+        
+        signed_tx = w3.eth.account.sign_transaction(main_tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        
+        # Don't wait for receipt in this function, just return hash
+        explorer_url = f"https://basescan.org/tx/{tx_hash.hex()}"
+        return {"ok": True, "tx_hash": tx_hash.hex(), "explorer_url": explorer_url}
+
+    except Exception as e:
+        logging.error(f"Error executing swap tx for user {user_id}: {e}", exc_info=True)
+        return {"ok": False, "error": f"On-chain execution failed: {e}"}
+
         
 def register_bot_payment_handlers(bot_instance):
     """
@@ -8116,8 +8544,6 @@ def register_bot_payment_handlers(bot_instance):
     if client is None:
         raise RuntimeError("register_bot_payment_handlers: passed object has no `.bot` Telethon client attribute")
 
-    # ---- /resolve (optional arg) ----
-    # ---- /resolve (optional arg) ----
     # ---- /resolve (optional arg) ----
     @client.on(events.NewMessage(pattern=re.compile(r'^/resolve(?:\s+(\S+))?$', re.IGNORECASE)))
     async def _on_resolve(event):
@@ -8145,8 +8571,6 @@ def register_bot_payment_handlers(bot_instance):
             await event.reply(f"Could not resolve `{name}` (no addr record).")
 
 
-    # ---- /pay (basic adapter) ----
-    # ---- /pay (basic adapter) ----
     # ---- /pay (basic adapter) ----
     @client.on(events.NewMessage(pattern=re.compile(r'^/pay(?:\s+(\d+(\.\d+)?))?$', re.IGNORECASE)))
     async def _on_pay(event):
@@ -8198,7 +8622,6 @@ def register_bot_payment_handlers(bot_instance):
         else:
             await event.reply(f"❌ Verification failed: {res.get('reason') or res.get('error') or 'unknown'}")
             
-    # ---- /register <name> (register basename using server-wallet by default) ----
     # ---- /register <name> (register basename using server-wallet by default) ----
     @client.on(events.NewMessage(pattern=re.compile(r'^/register\s+(\S+)', re.IGNORECASE)))
     async def _on_register(event):
@@ -8435,100 +8858,109 @@ def register_bot_payment_handlers(bot_instance):
             await event.reply(f"Error reading tracked wallets: {res.get('error')}")
             
     # ----------------------
-    # /base  -> show Base submenu (inline keyboard)
+    # calls Base sub-menu
     # ----------------------
     @client.on(events.NewMessage(pattern=re.compile(r'^/base\s*$', re.IGNORECASE)))
     async def _on_base_menu(event):
         """
-        Shows the Base submenu with the most important base-related user commands.
-        Buttons emit CallbackQuery events handled by _on_base_menu_callback below.
+        /base entrypoint kept for CLI/shortcut compatibility.
+        Routes into the class-based reply-keyboard show_base_menu if bot_instance is available.
         """
-        kb = [
-            [Button.inline("🔗 Link Wallet", b"base:link"), Button.inline("👤 My Wallet", b"base:my")],
-            [Button.inline("🔎 Resolve Name", b"base:resolve"), Button.inline("🆔 Register Name", b"base:register")],
-            [Button.inline("💳 Payments", b"base:pay"), Button.inline("⚙️ Settings", b"base:settings")],
-        ]
         try:
-            await event.reply("Base menu — quick actions:", buttons=kb)
-        except Exception:
-            # fallback for clients where reply with buttons may differ
-            await event.respond("Base menu — please use commands: /link_wallet, /me, /resolve, /register, /pay")
+            # Prefer the class-based menu (reply-keyboard) if bot_instance was created
+            if 'bot_instance' in globals() and getattr(globals()['bot_instance'], "show_base_menu", None):
+                try:
+                    await globals()['bot_instance'].show_base_menu(event)
+                    return
+                except Exception:
+                    # fallback to inline menu below if class call fails
+                    logging.exception("Calling bot_instance.show_base_menu failed; falling back to inline menu.")
+            # Fallback inline menu (very small): shows a note so users still get a result
+            kb = [
+                [Button.inline("🔗 Link Public Address", b"base:link"), Button.inline("👤 My Public Address", b"base:my")],
+                [Button.inline("🔎 Resolve Name", b"base:resolve"), Button.inline("🆔 Register Name", b"base:register")],
+                [Button.inline("💳 Payments", b"base:pay"), Button.inline("⚙️ Settings", b"base:settings")],
+                [Button.inline("➕ Track Third-Party Wallet", b"base:track_thirdparty")]
+            ]
+            await event.reply("Base menu — quick actions (fallback). Use the main menu for the full interface.", buttons=kb)
+        except Exception as e:
+            logging.exception("Unexpected error in _on_base_menu")
+            try:
+                await event.respond("Unable to open Base menu right now. Use the main menu.")
+            except Exception:
+                pass
 
-    @client.on(events.CallbackQuery())
+    # ----------------------
+    # CallbackQuery handler for base:*
+    # ----------------------
+    @client.on(events.CallbackQuery(pattern=b'base:.*'))
     async def _on_base_menu_callback(ev):
         """
-        Handle callback data from the Base submenu.
-        Data bytes: b"base:link", b"base:my", b"base:resolve", b"base:register", b"base:pay", b"base:settings"
+        Routes inline callback actions into the class-based text/menu handlers so
+        there is one canonical codepath (handle_base_menu) that processes the UI text.
         """
         try:
             data = ev.data.decode("utf-8") if isinstance(ev.data, (bytes, bytearray)) else str(ev.data)
         except Exception:
             data = str(ev.data)
 
-        user_id = ev.sender_id or (ev.query.user_id if hasattr(ev, "query") else None)
+        # Determine user id safely
+        user_id = ev.sender_id or getattr(getattr(ev, 'query', None), 'user_id', None)
+        if not user_id:
+            try:
+                await ev.answer("Could not identify user.", alert=True)
+            except Exception:
+                pass
+            return
 
-        # Acknowledge the callback quickly
+        # Acknowledge the callback quickly (remove loading indicator)
         try:
-            await ev.answer()  # silent answer to remove "loading"
+            await ev.answer()
         except Exception:
             pass
 
-        # route actions
+        # If bot_instance exists, call the class-based 'handle_base_menu' which expects (event, message)
+        if 'bot_instance' in globals() and getattr(globals()['bot_instance'], "handle_base_menu", None):
+            bot = globals()['bot_instance']
+            # Map callback actions into the exact text labels that handle_base_menu expects.
+            mapping = {
+                "base:link": "Link Public Address",
+                "base:my": "My Public Address",
+                "base:resolve": "Resolve Name",
+                "base:register": "Register Name",
+                "base:pay": "Payments",
+                "base:settings": "Settings",
+                "base:track_thirdparty": "➕ Track Third-Party Wallet",
+            }
+            mapped = mapping.get(data)
+            if mapped:
+                try:
+                    # call the class method which handles the same logic as text button presses
+                    await bot.handle_base_menu(ev, mapped)
+                except Exception:
+                    logging.exception("Error routing inline base: callback to handle_base_menu")
+                    try:
+                        await ev.respond("Error performing action. Try the main menu instead.")
+                    except Exception:
+                        pass
+                return
+            else:
+                try:
+                    await ev.respond("Unsupported Base action.")
+                except Exception:
+                    pass
+                return
+
+        # If no bot_instance, fall back to a minimal set of behaviors:
         if data == "base:link":
-            # call the link flow (create challenge) and reply with message
-            try:
-                msg = await run_blocking(create_link_challenge, user_id)
-                help_text = (
-                    "Sign the message with your wallet (MetaMask/Wallet). Then use:\n"
-                    "`/confirm_link <address?> <signature>`\n\n"
-                    "Example signature-only: `/confirm_link 0x2c64...`"
-                )
-                await ev.respond(f"Challenge message (sign exactly):\n\n```\n{msg}\n```\n\n{help_text}")
-            except Exception as e:
-                await ev.respond(f"Failed to create challenge: {e}")
-
-        elif data == "base:my":
-            try:
-                addr = await run_blocking(get_user_linked_address, user_id)
-                if addr:
-                    await ev.respond(f"Your linked wallet: `{addr}`")
-                else:
-                    await ev.respond("You do not have a linked wallet. Use `Link Wallet` to start.")
-            except Exception as e:
-                await ev.respond(f"Error reading linked wallet: {e}")
-
+            await ev.respond("To link a public address use the main menu -> Base -> Link Public Address.")
         elif data == "base:resolve":
-            # prompt user to use /resolve (quick help)
-            await ev.respond("To resolve a basename, send: `/resolve <name>`. Example: `/resolve alice.base`")
-
-        elif data == "base:register":
-            await ev.respond("To register a basename, send: `/register <name>` (e.g. `/register alice`).")
-
-        elif data == "base:pay":
-            await ev.respond("To start a payment, send `/pay <amount_usd>` (e.g. `/pay 5.00`).")
-
-        elif data == "base:settings":
-            # route to the settings submenu (see Area C)
-            kb = [
-                [Button.inline("➕ Track Wallet", b"settings:track"), Button.inline("➖ Untrack Wallet", b"settings:untrack")],
-                [Button.inline("📋 List Tracked", b"settings:list_tracked"), Button.inline("🔗 Linked Addr (admin)", b"settings:admin_links")],
-                [Button.inline("⬅️ Back", b"settings:back")]
-            ]
-            await ev.respond("Base settings:", buttons=kb)
-
+            await ev.respond("To resolve a .base name use the main menu -> Base -> Resolve Name.")
         else:
-            await ev.respond("Unknown action.")
-
-    # ----------------------
-    # Job helpers (Phase 1): /add_dest, /add_trader, /enable_onchain, /disable_onchain, /set_onchain_amount
-    # These are minimal helpers that call your forwarder instance methods for the current user's forwarder.
-    # Usage:
-    #   /add_dest <job_index> <dest1[,dest2,...]>
-    #   /add_trader <job_index> <https://webhook.url>
-    #   /enable_onchain <job_index> <amount_native>
-    #   /disable_onchain <job_index>
-    #   /set_onchain_amount <job_index> <amount_native>
-    # ----------------------
+            try:
+                await ev.respond("Base action not available. Use the main menu.")
+            except Exception:
+                pass
 
     @client.on(events.NewMessage(pattern=re.compile(r'^/add_dest\s+(\d+)\s+(.+)', re.IGNORECASE)))
     async def _on_add_dest(event):
@@ -8583,6 +9015,132 @@ def register_bot_payment_handlers(bot_instance):
             await event.reply(f"✅ Onchain transfer enabled for job {job_index} amount={amount}")
         except Exception as e:
             await event.reply(f"Error enabling onchain transfer: {e}")
+
+    @client.on(events.NewMessage(pattern=re.compile(r'^/send\s+(\S+)\s+([\d\.]+)', re.IGNORECASE)))
+    async def _on_send(event):
+        """
+        Usage: /send <recipient_address_or_basename> <amount_native>
+        Example: /send 0xAbCd... 0.01
+                 /send alice.base 0.005
+        Requires the user to have linked a private key via the Base menu ("Link Private Key for Buys").
+        """
+        user_id = event.sender_id
+        try:
+            recipient_input = event.pattern_match.group(1).strip()
+            amount_str = event.pattern_match.group(2).strip()
+            amount_native = float(amount_str)
+            if amount_native <= 0:
+                await event.reply("Amount must be positive.")
+                return
+        except Exception:
+            await event.reply("Usage: `/send <recipient> <amount>` (native Base amount).")
+            return
+
+        await event.reply("Preparing transfer...")
+
+        # Load user data (uses your existing loader — run in threadpool)
+        try:
+            if 'run_blocking' in globals():
+                user_data = await run_blocking(load_user_data, user_id) if 'load_user_data' in globals() else await run_blocking(bot_instance.load_user_data, user_id)
+            else:
+                loop = asyncio.get_running_loop()
+                user_data = await loop.run_in_executor(None, load_user_data, user_id)
+        except Exception as e:
+            await event.reply(f"Failed to load user data: {e}")
+            return
+
+        encrypted_pk = (user_data or {}).get('base_wallet_private_key_encrypted')
+        if not encrypted_pk:
+            await event.reply(
+                "⚠️ You have not linked a private key required to send funds.\n"
+                "Go to the Base menu → Link Private Key for Buys, or use `/link_wallet` + `/confirm_link` for watch-only."
+            )
+            return
+
+        # Resolve recipient if a basename
+        if recipient_input.endswith(".base"):
+            await event.reply(f"Resolving {recipient_input}...")
+            try:
+                if 'run_blocking' in globals():
+                    resolved = await run_blocking(resolve_basename, recipient_input)
+                else:
+                    loop = asyncio.get_running_loop()
+                    resolved = await loop.run_in_executor(None, resolve_basename, recipient_input)
+                if not resolved:
+                    await event.reply(f"Could not resolve `{recipient_input}` to an address.")
+                    return
+                recipient_addr = resolved
+            except Exception as e:
+                await event.reply(f"Resolve error: {e}")
+                return
+        else:
+            recipient_addr = recipient_input
+
+        # convert native amount to wei (18 decimals)
+        try:
+            from decimal import Decimal, InvalidOperation
+            value_wei = int(Decimal(str(amount_native)) * Decimal(10 ** 18))
+        except (InvalidOperation, Exception) as e:
+            await event.reply(f"Invalid amount: {e}")
+            return
+
+        # decrypt private key
+        try:
+            crypto = CryptoManager(user_id)
+            private_key = crypto.decrypt(encrypted_pk)
+        except Exception as e:
+            await event.reply("Failed to decrypt your private key. Ensure it's linked correctly.")
+            return
+
+        # perform the send in a threadpool so we don't block the loop
+        def _sync_send(pk, to_addr, value):
+            try:
+                w3 = connect_base_web3()
+                acct = Account.from_key(pk)
+                from_addr = acct.address
+                nonce = w3.eth.get_transaction_count(from_addr)
+                chain_id = getattr(w3.eth, "chain_id", None) or None
+
+                tx = {
+                    "to": to_addr,
+                    "value": int(value),
+                    "nonce": nonce,
+                    "chainId": chain_id,
+                    # gas and gasPrice estimated below
+                }
+
+                # estimate gas
+                try:
+                    tx_for_estimate = tx.copy()
+                    tx_for_estimate["from"] = from_addr
+                    estimated_gas = w3.eth.estimate_gas(tx_for_estimate)
+                    tx["gas"] = estimated_gas
+                except Exception:
+                    tx["gas"] = 21000  # fallback
+
+                try:
+                    tx["gasPrice"] = w3.eth.gas_price
+                except Exception:
+                    # optional fallback
+                    tx["gasPrice"] = int(20 * (10 ** 9))
+
+                signed = acct.sign_transaction(tx)
+                tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction).hex()
+                return {"ok": True, "tx_hash": tx_hash, "from": from_addr}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        try:
+            res = await run_blocking(_sync_send, private_key, recipient_addr, value_wei)
+        except Exception as e:
+            await event.reply(f"Error sending transaction: {e}")
+            return
+
+        if res.get("ok"):
+            await event.reply(f"✅ Transfer submitted.\nFrom: `{res.get('from')}`\nTo: `{recipient_addr}`\nTx: `{res.get('tx_hash')}`")
+        else:
+            await event.reply(f"❌ Transfer failed: {res.get('error')}")
+
 
     @client.on(events.NewMessage(pattern=re.compile(r'^/disable_onchain\s+(\d+)', re.IGNORECASE)))
     async def _on_disable_onchain(event):
