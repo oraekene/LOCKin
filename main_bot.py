@@ -21,12 +21,18 @@ import string
 import traceback
 import inspect
 import secrets
+import tempfile
+# import cachetools
+import glob
+import html
 from telethon import TelegramClient, errors, events, Button
-from telethon.tl.types import User
+from telethon.tl.types import User, Channel, Message
+from telethon.tl.custom import Button
 from telethon.errors import (SessionPasswordNeededError, PhoneCodeInvalidError,
                            ApiIdInvalidError, PhoneNumberInvalidError)
 
 from pathlib import Path
+from types import ModuleType
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -36,15 +42,21 @@ from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 from eth_account import Account
+from eth_account.messages import encode_defunct
+from dataclasses import dataclass, field
 # --- START: Subscription System Imports & Config ---
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from starlette.responses import JSONResponse
 from decimal import Decimal, InvalidOperation
-from web3 import Web3
-from typing import Optional, Tuple
-# edit these
-
+from web3 import Web3, HTTPProvider
+from market_api import MarketAPIAdapter
+from backtester import collect_historical_signals, validate_and_resolve_signals, SimpleTTLCache, DemoTrader
+from typing import List, Optional, Literal, Dict, Any, Tuple, Callable
+# from cachetools import TTLCache
+from error_handler3 import ErrorHandler, MarketAPIError, BacktestError, DemoTradingError, PersistenceError, ValidationError
+import sentry_sdk
+#
 
 app = FastAPI()
 # --- Environment-aware path configuration ---
@@ -65,7 +77,7 @@ def get_base_path():
 # --- Configuration (with session_fix) ---
 BASE_PATH = get_base_path()
 CRYPTO_DIR = os.path.join(BASE_PATH, "crypto")
-DATA_DIR = os.path.join(BASE_PATH, "data")
+DATA_DIR = os.path.join(BASE_PATH, "data") # ???
 SESSIONS_DIR = os.path.join(BASE_PATH, "sessions")  # ADDED FROM session_fix.txt
 os.makedirs(CRYPTO_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -203,7 +215,9 @@ def parse_bool(val, default=False):
     return v in ("1", "true", "yes", "y", "on")
 
 def load_configuration():
-    """Load configuration from environment variables"""
+    """Load configuration from environment variables (preserves original return tuple).
+    Also reads additional optional environment values used by performance/backtester/migration features.
+    """
     # Try to load from .env file in base path
     env_file = os.path.join(BASE_PATH, 'creds.env')
     if os.path.exists(env_file):
@@ -212,13 +226,13 @@ def load_configuration():
         # Fallback to system environment
         load_dotenv()
 
-    # Required environment variables
+    # Required environment variables (original)
     MASTER_SECRET = os.getenv('MASTER_SECRET')
     BOT_TOKEN = os.getenv('BOT_TOKEN')
     BOT_API_ID = os.getenv('BOT_API_ID')
     BOT_API_HASH = os.getenv('BOT_API_HASH')
 
-    # Validation
+    # Validation (original)
     if not MASTER_SECRET:
         raise ValueError("MASTER_SECRET environment variable is required")
     if not BOT_TOKEN:
@@ -233,12 +247,12 @@ def load_configuration():
     except ValueError:
         raise ValueError("BOT_API_ID must be a valid integer")
 
-    # Demo mode configuration
+    # Demo mode configuration (original)
     DEMO_MODE = parse_bool(os.getenv("DEMO_MODE"), default=False)
     DEMO_API_ID = None
     DEMO_API_HASH = None
     DEMO_PHONE_NUMBER = None
-    DEMO_SESSION_NAME = 'demo_session' # A default name
+    DEMO_SESSION_NAME = 'demo_session'  # A default name
 
     if DEMO_MODE:
         DEMO_API_ID = os.getenv('DEMO_API_ID')
@@ -255,34 +269,509 @@ def load_configuration():
         except ValueError:
             raise ValueError("DEMO_API_ID must be a valid integer")
 
+    # ---------------------------
+    # Additional optional settings (new features)
+    # ---------------------------
+    # Data directory for user files (default: <BASE_PATH>/data)
+    DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_PATH, "data"))
+
+    # Performance / demo trading defaults
+    try:
+        DEFAULT_POSITION_SIZE = float(os.getenv("DEFAULT_POSITION_SIZE", "1.0"))
+    except Exception:
+        DEFAULT_POSITION_SIZE = 1.0
+
+    try:
+        DEFAULT_FEES_PERCENT = float(os.getenv("DEFAULT_FEES_PERCENT", "0.4"))
+    except Exception:
+        DEFAULT_FEES_PERCENT = 0.4
+
+    try:
+        DEFAULT_SLIPPAGE_PERCENT = float(os.getenv("DEFAULT_SLIPPAGE_PERCENT", "0.5"))
+    except Exception:
+        DEFAULT_SLIPPAGE_PERCENT = 0.5
+
+    try:
+        MIN_MARKET_CAP = float(os.getenv("MIN_MARKET_CAP", "0"))
+    except Exception:
+        MIN_MARKET_CAP = 0.0
+
+    # Backtester defaults
+    try:
+        BACKTEST_MAX_HISTORY_DAYS = int(os.getenv("BACKTEST_MAX_HISTORY_DAYS", "30"))
+    except Exception:
+        BACKTEST_MAX_HISTORY_DAYS = 30
+
+    try:
+        BACKTEST_COLLECT_LIMIT = int(os.getenv("BACKTEST_COLLECT_LIMIT", "500"))
+    except Exception:
+        BACKTEST_COLLECT_LIMIT = 500
+
+    # Sentry / observability
+    SENTRY_DSN = os.getenv("SENTRY_DSN")
+
+    # Coinbase webhook secret (if you use coinbase endpoints)
+    COINBASE_WEBHOOK_SECRET = os.getenv("COINBASE_WEBHOOK_SECRET")
+
+    # Migration / startup behavior
+    MIGRATE_ON_START = parse_bool(os.getenv("MIGRATE_ON_START"), default=False)
+
+    # Return original tuple (keeps compatibility with existing unpacking)
     return (MASTER_SECRET, BOT_TOKEN, BOT_API_ID, BOT_API_HASH, DEMO_MODE,
             DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME)
 
-
-# Load configuration (This line remains the same)
 (MASTER_SECRET, BOT_TOKEN, BOT_API_ID, BOT_API_HASH, DEMO_MODE,
  DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME) = load_configuration()
 
+# -------------------------
+# Build module-level CONFIG dict for new features (performance/backtester/migration)
+# -------------------------
+CONFIG = {
+    # original essentials (convenience)
+    "MASTER_SECRET": MASTER_SECRET,
+    "BOT_TOKEN": BOT_TOKEN,
+    "BOT_API_ID": BOT_API_ID,
+    "BOT_API_HASH": BOT_API_HASH,
+    "DEMO_MODE": DEMO_MODE,
+    "DEMO_API_ID": DEMO_API_ID,
+    "DEMO_API_HASH": DEMO_API_HASH,
+    "DEMO_PHONE_NUMBER": DEMO_PHONE_NUMBER,
+    "DEMO_SESSION_NAME": DEMO_SESSION_NAME,
+
+    # new keys copied from environment / defaults (kept in sync with load_configuration)
+    "DATA_DIR": os.getenv("DATA_DIR", os.path.join(BASE_PATH, "data")),
+    "DEFAULT_POSITION_SIZE": float(os.getenv("DEFAULT_POSITION_SIZE", "1.0")),
+    "DEFAULT_FEES_PERCENT": float(os.getenv("DEFAULT_FEES_PERCENT", "0.4")),
+    "DEFAULT_SLIPPAGE_PERCENT": float(os.getenv("DEFAULT_SLIPPAGE_PERCENT", "0.5")),
+    "MIN_MARKET_CAP": float(os.getenv("MIN_MARKET_CAP", "0")),
+    "BACKTEST_MAX_HISTORY_DAYS": int(os.getenv("BACKTEST_MAX_HISTORY_DAYS", "30")),
+    "BACKTEST_COLLECT_LIMIT": int(os.getenv("BACKTEST_COLLECT_LIMIT", "500")),
+    "SENTRY_DSN": os.getenv("SENTRY_DSN"),
+    "COINBASE_WEBHOOK_SECRET": os.getenv("COINBASE_WEBHOOK_SECRET"),
+    "MIGRATE_ON_START": parse_bool(os.getenv("MIGRATE_ON_START"), default=False),
+    # convenience alias to match other code suggestions
+    "performance_settings": {
+        "default_position_size": float(os.getenv("DEFAULT_POSITION_SIZE", "1.0")),
+        "default_fees": float(os.getenv("DEFAULT_FEES_PERCENT", "0.4")),
+        "default_slippage": float(os.getenv("DEFAULT_SLIPPAGE_PERCENT", "0.5")),
+        "min_market_cap": float(os.getenv("MIN_MARKET_CAP", "0")),
+        "exit_rules": []
+    }
+}
+
+# Create module-level convenience names (optional, used by other code)
+DEFAULT_POSITION_SIZE = CONFIG["DEFAULT_POSITION_SIZE"]
+DEFAULT_FEES_PERCENT = CONFIG["DEFAULT_FEES_PERCENT"]
+DEFAULT_SLIPPAGE_PERCENT = CONFIG["DEFAULT_SLIPPAGE_PERCENT"]
+MIN_MARKET_CAP = CONFIG["MIN_MARKET_CAP"]
+BACKTEST_MAX_HISTORY_DAYS = CONFIG["BACKTEST_MAX_HISTORY_DAYS"]
+BACKTEST_COLLECT_LIMIT = CONFIG["BACKTEST_COLLECT_LIMIT"]
+SENTRY_DSN = CONFIG["SENTRY_DSN"]
+COINBASE_WEBHOOK_SECRET = CONFIG["COINBASE_WEBHOOK_SECRET"]
+MIGRATE_ON_START = CONFIG["MIGRATE_ON_START"]
+
+
+@dataclass
+class Signal:
+    # Core identification
+    type: Literal["contract", "cashtag", "keyword"]
+    identifier: str
+    detected_at: datetime.datetime  # UTC
+
+    # Source context
+    source_chat_id: Optional[int] = None
+    source_job_id: Optional[str] = None
+    original_message: Optional[str] = None
+    confidence_score: float = 0.0 # 0.0-1.0
+
+    # Market validation
+    resolved_symbol: Optional[str] = None
+    validation_status: Literal["pending", "valid", "invalid", "unsupported"] = "pending"
+    price_at_detection: Optional[float] = None
+    market_cap_at_detection: Optional[float] = None
+
+    # Metadata
+    signal_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    processing_errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class TradeLog:
+    # Trade identification
+    trade_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    signal: Optional[Signal] = None
+
+    # Entry details
+    entry_time: Optional[datetime.datetime] = None  # UTC
+    entry_price: float = 0.0
+    entry_market_cap: Optional[float] = None
+
+    # Exit details (populated when trade closes)
+    exit_time: Optional[datetime.datetime] = None
+    exit_price: Optional[float] = None
+    exit_reason: Optional[Literal["time", "multiple", "stop_loss", "take_profit", "manual"]] = None
+
+    # Performance metrics
+    raw_pnl_percent: Optional[float] = None
+    adjusted_pnl_percent: Optional[float] = None
+    hold_duration_seconds: Optional[int] = None
+
+    # Position sizing
+    position_size_percent: float = 1.0
+    portfolio_value_at_entry: Optional[float] = None
+    absolute_pnl: Optional[float] = None
+
+    # Trade context
+    is_demo: bool = True
+    fees_percent: float = 0.0
+    slippage_percent: float = 0.0
+
+
+class DataMigrationManager:
+    """Handle migration of existing user data to support new features.
+
+    Usage:
+      mgr = DataMigrationManager()
+      migrated = mgr.migrate(user_obj)              # returns migrated dict (compatible)
+      migrated, changes = mgr.migrate_with_changes(user_obj)   # returns tuple
+
+    Utilities:
+      mgr.migrate_user_file(path, crypto_manager)   # reads/decrypts, migrates, writes atomically if changed
+      mgr.batch_migrate_folder(data_dir, crypto_factory, progress_callback)
+    """
+
+    CURRENT_VERSION = 2
+
+    # Common top-level key renames: old_key -> new_key
+    MAPPINGS = {
+        "performance": "performance_settings",
+        "perf_settings": "performance_settings",
+        "trade_log": "trade_logs",
+        "trade_logs": "trade_logs",
+        "backtests": "backtest_history",
+        "backtest": "backtest_history",
+        "demo_trade": "demo_trades",
+        "analytics": "analytics_cache",
+        "usage": "usage_tracking",
+        # some old variants
+        "pos_size": "performance_settings.default_position_size",
+        "fees": "performance_settings.default_fees",
+        "slippage": "performance_settings.default_slippage",
+    }
+
+    PERF_FIELD_RENAMES = {
+        "pos_size": "default_position_size",
+        "position_size": "default_position_size",
+        "default_size": "default_position_size",
+        "fee_pct": "default_fees",
+        "fee": "default_fees",
+        "slip": "default_slippage",
+        "slippage_pct": "default_slippage",
+    }
+
+    @staticmethod
+    def needs_migration(user_data: Dict) -> bool:
+        """Return True if the stored user_data is older than the CURRENT_VERSION."""
+        try:
+            return int(user_data.get("migration_version", 0) or 0) < DataMigrationManager.CURRENT_VERSION
+        except Exception:
+            return True
+
+    @staticmethod
+    def _set_nested(d: Dict, dotted_key: str, value):
+        """Set nested key like 'performance_settings.default_fees' safely."""
+        parts = dotted_key.split(".")
+        cur = d
+        for i, p in enumerate(parts):
+            if i == len(parts) - 1:
+                cur[p] = value
+            else:
+                if p not in cur or not isinstance(cur[p], dict):
+                    cur[p] = {}
+                cur = cur[p]
+
+    def migrate(self, user_obj: Dict) -> Dict:
+        """
+        Idempotent migration function: returns a migrated *copy* of user_obj.
+        Does not write files — callers perform that.
+        """
+        u = copy.deepcopy(user_obj) if user_obj is not None else {}
+        changed = False
+
+        # top-level mapping renames
+        for old, new in self.MAPPINGS.items():
+            if old in u and new not in u:
+                # set nested
+                if "." in new:
+                    self._set_nested(u, new, u.pop(old))
+                else:
+                    u[new] = u.pop(old)
+                changed = True
+
+        # normalize performance_settings keys
+        perf = u.get("performance_settings", {})
+        for oldk, newk in self.PERF_FIELD_RENAMES.items():
+            if oldk in perf and newk not in perf:
+                perf[newk] = perf.pop(oldk)
+                changed = True
+        if perf:
+            u["performance_settings"] = perf
+
+        # ensure migration_version set
+        if int(u.get("migration_version", 0) or 0) < self.CURRENT_VERSION:
+            u["migration_version"] = self.CURRENT_VERSION
+            changed = True
+
+        return u
+
+    def migrate_with_changes(self, user_obj: Dict) -> Tuple[Dict, List[str]]:
+        """Return (migrated_obj, list_of_changes)."""
+        before = json.dumps(user_obj or {}, sort_keys=True)
+        after_obj = self.migrate(user_obj or {})
+        after = json.dumps(after_obj or {}, sort_keys=True)
+        changes = []
+        if before != after:
+            # rudimentary diff reporting
+            changes.append("structure/fields changed")
+        return after_obj, changes
+
+    def migrate_user_file(self, file_path: str, crypto_manager_factory) -> Tuple[bool, List[str]]:
+        """
+        Read file_path (user_*.dat), decrypt via crypto_manager_factory(uid), migrate, and write back if changed.
+        Returns (ok: bool, changes: list[str]).
+        """
+        logger = logging.getLogger("DataMigrationManager")
+        try:
+            base = os.path.basename(file_path)
+            uid = None
+            if base.startswith("user_") and base.endswith(".dat"):
+                try:
+                    uid = int(base.split("_", 1)[1].split(".dat", 1)[0])
+                except Exception:
+                    uid = None
+
+            # instantiate crypto for this file
+            cm = crypto_manager_factory(uid) if callable(crypto_manager_factory) else crypto_manager_factory
+            # read existing bytes
+            with open(file_path, "rb") as f:
+                enc = f.read()
+
+            try:
+                text = cm.decrypt(enc) if hasattr(cm, "decrypt") else cm(enc)
+            except Exception:
+                # maybe the file is plain JSON; attempt decode
+                try:
+                    text = enc.decode("utf-8")
+                except Exception:
+                    logger.exception("Failed to decrypt or decode %s", file_path)
+                    return False, ["decrypt_error"]
+
+            try:
+                user_obj = json.loads(text)
+            except Exception:
+                logger.exception("Failed to parse JSON for %s", file_path)
+                user_obj = {}
+
+            migrated, changes = self.migrate_with_changes(user_obj)
+            if not changes:
+                return True, []
+
+            # atomic write
+            plaintext = json.dumps(migrated, indent=2)
+            ciphertext = cm.encrypt(plaintext) if hasattr(cm, "encrypt") else cm(plaintext)
+
+            fd, tmp_path = tempfile.mkstemp(prefix=f"user_migrate_{uid}_", suffix=".tmp", dir=os.path.dirname(file_path))
+            try:
+                with os.fdopen(fd, "wb") as tmpf:
+                    if isinstance(ciphertext, str):
+                        tmpf.write(ciphertext.encode("utf-8"))
+                    else:
+                        tmpf.write(ciphertext)
+                    tmpf.flush()
+                    os.fsync(tmpf.fileno())
+                os.replace(tmp_path, file_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try: os.remove(tmp_path)
+                    except Exception: pass
+            return True, changes
+        except Exception as e:
+            logger.exception("Failed to migrate %s: %s", file_path, e)
+            return False, [f"exception: {e}"]
+
+    def batch_migrate_folder(self, data_dir: str, crypto_manager_factory, progress_callback: Optional[Callable] = None) -> Tuple[int, int, List[Tuple[str, List[str]]]]:
+        """
+        Batch migrate all user_*.dat files in data_dir.
+        - crypto_manager_factory: callable(user_id) -> CryptoManager or a CryptoManager instance
+        - progress_callback(idx, total, file_path, changes) optional to update UI
+        Returns: (migrated_count, total_files, list_of_errors[(path,changes)])
+        """
+        pattern = os.path.join(data_dir, "user_*.dat")
+        files = sorted(glob.glob(pattern))
+        total = len(files)
+        migrated_count = 0
+        errors: List[Tuple[str, List[str]]] = []
+
+        for idx, path in enumerate(files, start=1):
+            ok, changes = self.migrate_user_file(path, crypto_manager_factory)
+            if ok:
+                migrated_count += 1
+            else:
+                errors.append((path, changes))
+            if progress_callback:
+                try:
+                    progress_callback(idx, total, path, changes)
+                except Exception:
+                    logger.exception("progress_callback failed for %s", path)
+        return migrated_count, total, errors
+        
+#### module level
+def run_migrate_all_users(data_dir: str = DATA_DIR,
+                          crypto_factory = None,
+                          dry_run: bool = True,
+                          backup: bool = True,
+                          concurrency: int = 4,
+                          progress_callback: Optional[Callable] = None) -> dict:
+    """
+    Run a batch migration over all user_*.dat files in `data_dir` using DataMigrationManager.
+
+    - data_dir: directory where user files live (default DATA_DIR)
+    - crypto_factory: callable(user_id) -> CryptoManager instance OR a CryptoManager instance.
+                      If None, uses lambda uid: CryptoManager(uid).
+    - dry_run: if True, don't write any changed files; only report what would change.
+    - backup: if True and not dry_run, create per-file backups before replacing.
+    - concurrency: number of concurrent workers (not strictly required; kept for future extension)
+    - progress_callback: optional callback(idx, total, path, changes) for progress updates.
+
+    Returns a dict: { 'migrated_count': int, 'total_files': int, 'errors': [(path,changes), .], 'changes_summary': [.] }
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if crypto_factory is None:
+        crypto_factory = lambda uid: CryptoManager(uid)
+
+    mgr = DataMigrationManager()
+    pattern = os.path.join(data_dir, "user_*.dat")
+    files = sorted(glob.glob(pattern))
+    total = len(files)
+    migrated_count = 0
+    errors = []
+    changes_summary = []
+
+    def _worker(path):
+        # attempt to detect uid from filename; allow None
+        uid = None
+        base = os.path.basename(path)
+        try:
+            if base.startswith("user_") and base.endswith(".dat"):
+                uid = int(base.split("_", 1)[1].split(".dat", 1)[0])
+        except Exception:
+            uid = None
+
+        # We will call migrate_user_file which already handles decrypt/encrypt/write.
+        try:
+            ok, changes = mgr.migrate_user_file(path, crypto_factory)
+            return (path, ok, changes)
+        except Exception as e:
+            return (path, False, [f"exception: {e}"])
+
+    # Use ThreadPoolExecutor for IO-bound ops; keep concurrency modest
+    if concurrency and total > 1:
+        with ThreadPoolExecutor(max_workers=min(concurrency, max(1, total))) as ex:
+            futures = { ex.submit(_worker, p): p for p in files }
+            for idx, fut in enumerate(as_completed(futures), start=1):
+                path = futures[fut]
+                try:
+                    p, ok, changes = fut.result()
+                except Exception as e:
+                    errors.append((path, [f"unhandled exception: {e}"]))
+                    if progress_callback:
+                        progress_callback(idx, total, path, ["error"])
+                    continue
+
+                if ok:
+                    migrated_count += 1
+                    changes_summary.append((path, changes))
+                    if progress_callback:
+                        progress_callback(idx, total, path, changes)
+                else:
+                    errors.append((path, changes))
+                    if progress_callback:
+                        progress_callback(idx, total, path, changes)
+    else:
+        # sequential fallback
+        for idx, path in enumerate(files, start=1):
+            p, ok, changes = _worker(path)
+            if ok:
+                migrated_count += 1
+                changes_summary.append((path, changes))
+            else:
+                errors.append((path, changes))
+            if progress_callback:
+                progress_callback(idx, total, path, changes)
+
+    result = {
+        "migrated_count": migrated_count,
+        "total_files": total,
+        "errors": errors,
+        "changes_summary": changes_summary
+    }
+    return result
 
 # --- SECURITY: Master secret-based encryption with per-user salts ---
 class CryptoManager:
-    """Handles encryption and decryption using master secret with per-user derivation."""
-    def __init__(self, user_id: int):
-        self.user_id = str(user_id)
+    """Handles encryption and decryption using master secret with per-user derivation.
+
+    - Keeps PBKDF2HMAC + Fernet for strong security.
+    - If user_id is None, uses a shared salt file 'salt_shared.key'.
+    - encrypt(plaintext: str) -> bytes
+    - decrypt(ciphertext: bytes) -> str
+    """
+
+    def __init__(self, user_id: Optional[int] = None, master_secret: Optional[str] = None):
+        # allow None user_id (shared file use)
+        self.user_id = str(user_id) if user_id is not None else "shared"
         self.salt_path = Path(CRYPTO_DIR) / f"salt_{self.user_id}.key"
+        # master secret priority:
+        # 1) explicit arg, 2) module-level MASTER_SECRET, 3) env DATA_ENCRYPTION_KEY
+        if master_secret:
+            self.master_secret = master_secret
+        else:
+            self.master_secret = globals().get("MASTER_SECRET") or os.getenv("DATA_ENCRYPTION_KEY")
+        if not self.master_secret:
+            raise RuntimeError("No master secret available for CryptoManager (set MASTER_SECRET or DATA_ENCRYPTION_KEY)")
+
         self.salt = self._get_or_create_salt()
         self.key = self._derive_key()
 
     def _get_or_create_salt(self) -> bytes:
-        if self.salt_path.exists():
-            return self.salt_path.read_bytes()
-        salt = os.urandom(16)
-        self.salt_path.write_bytes(salt)
-        logging.info(f"🔐 New salt file created for user {self.user_id}")
-        return salt
+        """Return per-user salt bytes; create file if missing."""
+        try:
+            if self.salt_path.exists():
+                return self.salt_path.read_bytes()
+            # ensure directory exists
+            self.salt_path.parent.mkdir(parents=True, exist_ok=True)
+            salt = os.urandom(16)
+            # write atomically
+            fd, tmp = tempfile.mkstemp(dir=str(self.salt_path.parent))
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(salt)
+                os.replace(tmp, str(self.salt_path))
+            finally:
+                if os.path.exists(tmp):
+                    try: os.remove(tmp)
+                    except Exception: pass
+            logging.info(f"🔐 New salt file created for user {self.user_id}")
+            return salt
+        except Exception:
+            # If file IO fails, return an in-memory random salt (won't persist)
+            logging.exception("Failed to read/create salt file; falling back to ephemeral salt")
+            return os.urandom(16)
 
     def _derive_key(self, iterations: int = 390_000) -> bytes:
-        pwd = f"{MASTER_SECRET}-{self.user_id}".encode()
+        """Derive a Fernet-compatible key from master secret + user_id using PBKDF2."""
+        pwd = f"{self.master_secret}-{self.user_id}".encode("utf-8")
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
@@ -290,78 +779,269 @@ class CryptoManager:
             iterations=iterations,
             backend=default_backend()
         )
-        return base64.urlsafe_b64encode(kdf.derive(pwd))
+        raw = kdf.derive(pwd)
+        return base64.urlsafe_b64encode(raw)
 
     def encrypt(self, data: str) -> bytes:
+        """Encrypt a UTF-8 string and return bytes to write to disk."""
         f = Fernet(self.key)
-        return f.encrypt(data.encode())
+        return f.encrypt(data.encode("utf-8"))
 
     def decrypt(self, encrypted_data: bytes) -> str:
+        """Decrypt bytes and return UTF-8 string. Raises ValueError on failure."""
         f = Fernet(self.key)
         try:
-            return f.decrypt(encrypted_data).decode()
+            return f.decrypt(encrypted_data).decode("utf-8")
         except InvalidToken:
             raise ValueError("Decryption failed: invalid token or key.")
+
+    # Optional helper used by migration / atomic write logic
+    @staticmethod
+    def atomic_write_bytes(path: str, data: bytes) -> None:
+        """Write bytes to path atomically (tmp -> replace)."""
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="tmp_", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
             
-    # --- FastAPI webhook route handler for Coinbase Commerce ---
-    @app.post("/api/payments/coinbase/webhook")
-    async def coinbase_webhook(request: Request):
-        """
-        FastAPI POST endpoint that accepts Coinbase Commerce webhooks (raw bytes + signature header),
-        verifies and processes them by calling coinbase_handle_webhook(...).
+    # --- FastAPI webhook route handler for Coinbase Commerce. OLD POINT ---
+# Module-level FastAPI route for Coinbase webhooks
+@app.post("/api/payments/coinbase/webhook")
+   
+def save_user_performance_settings_exit_rules(user_id: int,
+                                              new_rules: List[Dict[str, Any]],
+                                              main_module: Any = None) -> None:
+    """
+    Save the given list of exit-rule dicts to the user's encrypted file atomically.
 
-        Expects the Coinbase signature header (try common header names). Returns 200/202 quickly.
-        """
-        # read raw request body (required for signature verification)
+    - user_id: the integer telegram user id
+    - new_rules: a list of normalized exit-rule dicts (as produced by parse_exit_rule_from_text or other UI)
+    - main_module: optional module object (the running main module). If None we attempt a robust dynamic import
+                   of main_bot.py to obtain DATA_DIR and CryptoManager.
+    """
+    if main_module is None:
+        # assume this file is inside the same module; import by filename to be robust
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "main_bot.py")
+        spec = importlib.util.spec_from_file_location("main_bot", path)
+        mm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mm)
+    else:
+        mm = main_module
+
+    CryptoManager = getattr(mm, "CryptoManager", None)
+    if CryptoManager is None:
+        raise RuntimeError("CryptoManager not found in module when saving exit rules")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    user_file = os.path.join(DATA_DIR, f"user_{user_id}.dat")
+
+    # read existing
+    user_obj = {}
+    if os.path.exists(user_file):
         try:
-            body_bytes = await request.body()
+            with open(user_file, "rb") as f:
+                enc = f.read()
+            text = CryptoManager.decrypt(enc)
+            user_obj = json.loads(text)
         except Exception as e:
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"could not read request body: {e}"})
+            logging.debug("Failed to read/decrypt existing user file: %s", e)
+            user_obj = {}
 
-        # Coinbase signature header names vary in docs; accept common variants
-        signature_header = None
-        hdrs = request.headers
-        for h in ("X-CC-Webhook-Signature", "X-CC-Webhook-Sig", "X-Cc-Webhook-Signature", "X-CC-Signature"):
-            if h in hdrs:
-                signature_header = hdrs[h]
-                break
-        # fallback to any header that contains 'coinbase' or 'cc' and 'sig'
-        if not signature_header:
-            for k, v in hdrs.items():
-                kl = k.lower()
-                if ("coinbase" in kl or "cc" in kl) and ("sig" in kl or "signature" in kl):
-                    signature_header = v
-                    break
+    perf = user_obj.get("performance_settings", {})
+    perf["exit_rules"] = new_rules
+    user_obj["performance_settings"] = perf
 
-        # Resolve send_message and admin notify callables from module-level bot_instance if available
-        send_message_callable = None
-        admin_notify_callable = None
+    plaintext = json.dumps(user_obj, indent=2)
+    ciphertext = CryptoManager.encrypt(plaintext)
+
+    # atomic write to user_file using tmp then replace
+    fd, tmp_path = tempfile.mkstemp(prefix=f"user_{user_id}_", suffix=".tmp", dir=DATA_DIR)
+    with os.fdopen(fd, "wb") as tmpf:
+        tmpf.write(ciphertext)
+    os.replace(tmp_path, user_file)
+
+# Top-level /setexit command handler (standalone)
+# ----------------------------
+async def on_setexit(event):
+    """
+    Minimal top-level handler to parse '/setexit <rule>' and persist the rule.
+    If your architecture registers methods on the TelegramBot class, adapt by moving
+    this into the class and calling save_user_performance_settings_exit_rules() there.
+    """
+    try:
+        sender = await event.get_sender()
+        user_id = sender.id
+        text = event.message.message
+        raw = text.partition(" ")[2].strip()
+        if not raw:
+            await event.reply("Usage: /setexit <json or shorthand>")
+            return
+        # A simple parse: expect JSON dict or shorthand like "tp:2"
+        rule = None
         try:
-            # if make_send_message_callable and bot_instance are available in module scope, use them
-            send_message_callable = make_send_message_callable(bot_instance)  # noqa: F821
+            rule = json.loads(raw)
         except Exception:
-            # leave None if not resolvable; coinbase_handle_webhook tolerates None
-            send_message_callable = None
+            # simple shorthand parsing: "tp:2" -> {"type":"take_profit","value":2}
+            if ":" in raw:
+                k,v = raw.split(":",1)
+                if k.lower() in ("tp","take","take_profit"):
+                    rule = {"type":"take_profit","value":float(v)}
+                elif k.lower() in ("sl","stop","stop_loss"):
+                    rule = {"type":"stop_loss","value":-abs(float(v))}
+            if rule is None:
+                await event.reply("Could not parse rule. Provide JSON or shorthand like 'tp:2' or 'sl:10'")
+                return
 
+        save_user_performance_settings_exit_rules(user_id, [rule], main_module=globals().get("__name__") and __import__(__name__))
+        await event.reply("Exit rule saved.")
+    except Exception:
+        logging.exception("on_setexit failed")
         try:
-            admin_notify_callable = make_admin_notify_callable(bot_instance)  # noqa: F821
+            await event.reply("Failed to save exit rule.")
         except Exception:
-            admin_notify_callable = None
+            pass
 
-        # call the core handler you already added in the monolith
+# Backtest progress & summary helpers (thin wrappers)
+# ----------------------------
+# ----------------------------
+# Backtester -> Bot helpers (UI)
+# Keep these in the bot (UI layer), do NOT move to backtester.
+# ----------------------------
+
+def make_progress_callback_for_telegram(bot, chat_id: int, status_message_id: Optional[int] = None, throttle_seconds: float = 1.0) -> Callable[[int, int, Optional[str]], None]:
+    """
+    Returns a callback `cb(collected, scanned, last_msg)` suitable for passing to the backtester.
+    - bot: your Telegram client instance with send_message/edit_message methods.
+    - chat_id: where progress messages will be sent/edited.
+    - status_message_id: if provided, callback will attempt to edit that message; otherwise it will send updates.
+    The callback is *sync-callable* by the backtester; it schedules edits asynchronously.
+    Additionally, `cb.async_callback` is available if the backtester wants an awaitable callback.
+    """
+    last_update = {"ts": 0.0}
+    lock = asyncio.Lock()
+
+    async def _do_update(text: str):
         try:
-            result = coinbase_handle_webhook(body_bytes, signature_header, None, send_message_callable=send_message_callable, admin_notify_callable=admin_notify_callable) # noqa: F821
-        except Exception as e:
-            # surface minimal info and return 500 so Coinbase can retry if needed
+            # try to edit if message id supplied
+            if status_message_id and hasattr(bot, "edit_message"):
+                try:
+                    # Telethon style: bot.edit_message(chat_id, message_id, text)
+                    await bot.edit_message(chat_id, status_message_id, text)
+                    return
+                except Exception:
+                    # fallback attempt for other clients
+                    try:
+                        await bot.edit_message_text(text, chat_id=chat_id, message_id=status_message_id)
+                        return
+                    except Exception:
+                        pass
+            # if edit fails or not provided, send new message
+            if hasattr(bot, "send_message"):
+                await bot.send_message(chat_id, text)
+        except Exception:
+            # don't let UI errors crash the backtester
             try:
-                if admin_notify_callable:
-                    admin_notify_callable(f"coinbase_webhook handler exception: {e}")
+                # last resort: synchronous print to logs
+                import logging
+                logging.exception("Progress update failed")
             except Exception:
                 pass
-            return JSONResponse(status_code=500, content={"ok": False, "error": f"handler exception: {e}"})
 
-        # Successful processing -> return 200
-        return JSONResponse(status_code=200, content={"ok": True, "result": result})
+    async def _async_cb(collected: int, scanned: int, last: Optional[str]):
+        async with lock:
+            now = time.time()
+            if now - last_update["ts"] < throttle_seconds:
+                return
+            last_update["ts"] = now
+        last_txt = html.escape(str(last)) if last is not None else "—"
+        txt = f"<b>Backtest progress</b>\nScanned: <code>{scanned}</code>\nSignals: <code>{collected}</code>\nLast: <code>{last_txt}</code>"
+        await _do_update(txt)
+
+    def _sync_cb(collected: int, scanned: int, last: Optional[str]):
+        """
+        Synchronous wrapper that schedules the async update.
+        The backtester can call this from sync code.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            # if we're already in an event loop schedule the async version
+            asyncio.create_task(_async_cb(collected, scanned, last))
+        except RuntimeError:
+            # no running loop — try to run the event loop to perform update (best effort, non-blocking)
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                new_loop.run_until_complete(_async_cb(collected, scanned, last))
+                new_loop.close()
+            except Exception:
+                # swallow errors to avoid breaking the backtester
+                pass
+
+    # attach an awaitable variant in case backtester wants to await progress updates
+    _sync_cb.async_callback = _async_cb
+    return _sync_cb
+
+def format_backtest_summary(result: Dict[str, Any]) -> str:
+    """
+    Format the result returned by the backtester into an HTML-friendly summary string.
+    Keep formatting here in the bot as it's a UI concern.
+    Expected `result` structure is flexible; this function uses common keys:
+      - result.get("total_scanned"), result.get("total_signals"),
+      - result.get("positions") -> list of dicts with pnl % etc.
+      - result.get("error") if present
+    """
+    if not result:
+        return "No backtest result."
+
+    if "error" in result and result["error"]:
+        return f"<b>Backtest error</b>\n{html.escape(str(result['error']))}"
+
+    total_scanned = result.get("total_scanned", result.get("raw_signals_count", 0))
+    total_signals = result.get("total_signals", result.get("resolved_signals_count", 0))
+    positions = result.get("positions", result.get("trades", [])) or []
+
+    closed = sum(1 for p in positions if p.get("closed", True))
+    profitable = sum(1 for p in positions if p.get("raw_pnl_percent", 0) > 0)
+    total_pnl = sum(p.get("raw_pnl_percent", 0) for p in positions)
+    avg_pnl = (total_pnl / closed) if closed else 0.0
+
+    lines = [
+        "<b>Backtest complete</b>",
+        f"Scanned messages: <code>{total_scanned}</code>",
+        f"Signals found: <code>{total_signals}</code>",
+        f"Positions closed: <code>{closed}</code>",
+        f"Profitable positions: <code>{profitable}</code>",
+        f"Total PnL (%): <code>{total_pnl:.4f}</code>",
+        f"Average PnL per position (%): <code>{avg_pnl:.4f}</code>",
+    ]
+
+    # Add short table of top/bottom positions if available
+    if positions:
+        # sort by pnl descending
+        top = sorted(positions, key=lambda x: x.get("raw_pnl_percent", 0), reverse=True)[:3]
+        bottom = sorted(positions, key=lambda x: x.get("raw_pnl_percent", 0))[:3]
+        lines.append("\n<b>Top positions</b>")
+        for p in top:
+            sym = p.get("signal", {}).get("resolved_symbol") if p.get("signal") else p.get("symbol", "unknown")
+            lines.append(f"{sym} — PnL: <code>{p.get('raw_pnl_percent',0):.2f}%</code>")
+        lines.append("\n<b>Worst positions</b>")
+        for p in bottom:
+            sym = p.get("signal", {}).get("resolved_symbol") if p.get("signal") else p.get("symbol", "unknown")
+            lines.append(f"{sym} — PnL: <code>{p.get('raw_pnl_percent',0):.2f}%</code>")
+
+    return "\n".join(lines)
+
+####
 
 # MODULE LEVEL            
 def init_payments_db(_db_conn=None):
@@ -577,12 +1257,6 @@ def register_basename_tx(private_key: str, label: str, duration: int = 31536000,
     - If resolver is None the function will use the well-known L2Resolver for the chain.
     - Uses connect_base_web3() helper from the monolith (must be present).
     """
-    try:
-        # lazy import local helpers (so this file doesn't require web3 at import-time)
-        from eth_account import Account
-        from web3 import Web3
-    except Exception as e:
-        return {"ok": False, "error": f"missing dependency web3/eth_account: {e}"}
 
     try:
         w3 = connect_base_web3()  # your existing helper
@@ -753,9 +1427,6 @@ def handle_register_request(user_id: int, label: str, use_server_wallet: bool = 
         "error": "<message>"
       }
     """
-    # defensive imports
-    from web3 import Web3
-    import os
 
     # sanitize label
     label = label.strip().lower()
@@ -928,82 +1599,7 @@ def create_link_challenge(user_id: int) -> str:
     profiles[uid] = p
     _save_user_profiles(profiles)
     return message
-
-
-def verify_wallet_signature(user_id: int, address: str, signature: str) -> dict:
-    """
-    Verify an Ethereum signature for the stored challenge message.
-    - address: the hex address the user claims (case-insensitive). Accepts 0x... form.
-    - signature: hex signature string (0x-prefixed).
-    Returns dict:
-      {"ok": True, "address": "<checksum>", "reason": None}
-      or {"ok": False, "reason": "..."}
-
-    Uses eth_account to recover address from signed message (encode_defunct).
-    """
-    try:
-        from eth_account.messages import encode_defunct
-        from eth_account import Account
-    except Exception as e:
-        return {"ok": False, "reason": f"eth_account required: {e}"}
-
-    profiles = _load_user_profiles()
-    uid = str(user_id)
-    p = profiles.get(uid)
-    if not p or "challenge" not in p:
-        return {"ok": False, "reason": "no active challenge found; request a new /link_wallet first"}
-
-    challenge = p["challenge"]
-    expires = int(challenge.get("expires", 0))
-    now = int(time.time())
-    if now > expires:
-        # clear stale challenge
-        p.pop("challenge", None)
-        profiles[uid] = p
-        _save_user_profiles(profiles)
-        return {"ok": False, "reason": "challenge expired; request a new /link_wallet"}
-
-    message = challenge.get("message")
-    if not message:
-        return {"ok": False, "reason": "challenge message missing (internal error)"}
-
-    # normalize signature/address
-    sig = signature.strip()
-    if sig.startswith('"') and sig.endswith('"'):
-        sig = sig[1:-1]
-    if not sig.startswith("0x"):
-        # try to tolerate bare hex
-        sig = "0x" + sig
-
-    try:
-        encoded = encode_defunct(text=message)
-        recovered = Account.recover_message(encoded, signature=sig)
-    except Exception as e:
-        return {"ok": False, "reason": f"signature verification failed: {e}"}
-
-    # normalize checksum of recovered and provided address
-    try:
-        from web3 import Web3
-        recovered_c = Web3.to_checksum_address(recovered)
-        provided_c = Web3.to_checksum_address(address)
-    except Exception:
-        # fallback to lowercase compare
-        recovered_c = recovered.lower()
-        provided_c = address.lower()
-
-    if recovered_c != provided_c:
-        return {"ok": False, "reason": "signature does not match the provided address"}
-
-    # success: bind address to user and clear challenge
-    p["linked_address"] = recovered_c
-    p.pop("challenge", None)
-    profiles[uid] = p
-    saved = _save_user_profiles(profiles)
-    if not saved:
-        return {"ok": False, "reason": "failed to persist profile (disk error)"}
-
-    return {"ok": True, "address": recovered_c, "reason": None}
-    
+  
 # -------------------------
 # User profiles helpers: updated verify + helpers
 # Place at module-level (no indentation) near the other profile helpers.
@@ -1047,16 +1643,6 @@ def verify_wallet_signature(user_id: int, address: Optional[str], signature: str
 
     NOTE: this is a safe replacement for the earlier verify_wallet_signature.
     """
-    try:
-        from eth_account.messages import encode_defunct
-        from eth_account import Account
-    except Exception as e:
-        return {"ok": False, "reason": f"eth_account required: {e}"}
-
-    try:
-        from web3 import Web3
-    except Exception:
-        Web3 = None  # we'll fallback to lower-case comparison if web3 not available
 
     profiles = _load_user_profiles()
     uid = str(user_id)
@@ -1137,10 +1723,6 @@ def verify_wallet_signature(user_id: int, address: Optional[str], signature: str
 
 def add_tracked_base_wallet(user_id: int, wallet_address: str) -> dict:
     """Add wallet to user's tracked_wallets in user_profiles.json"""
-    try:
-        from web3 import Web3
-    except Exception:
-        return {"ok": False, "error": "web3 required"}
 
     profiles = _load_user_profiles()
     uid = str(user_id)
@@ -1168,7 +1750,6 @@ def remove_tracked_base_wallet(user_id: int, wallet_address: str) -> dict:
     tracked = p.get("tracked_wallets", {})
     addr = wallet_address
     try:
-        from web3 import Web3
         addr = Web3.toChecksumAddress(wallet_address)
     except Exception:
         pass
@@ -1256,11 +1837,6 @@ def connect_base_web3():
     Raises:
         RuntimeError if connection cannot be established.
     """
-    
-    try:
-        from web3 import Web3, HTTPProvider  # local import so monolith can still run if unused
-    except Exception as e:
-        raise RuntimeError("web3.py is required for connect_base_web3. Install with `pip install web3`.") from e
 
     rpc_url = os.getenv("BASE_RPC_URL") or os.getenv("BASE_SEPOLIA_RPC") or os.getenv("BASE_RPC")
     if not rpc_url:
@@ -1332,7 +1908,6 @@ def get_web3_for_chain(chain: Optional[str|int]):
         rpc = os.getenv("ETHEREUM_RPC_URL") or os.getenv("FALLBACK_RPC_URL")
         if not rpc:
             raise RuntimeError("ETHEREUM_RPC_URL not set")
-        from web3 import Web3, HTTPProvider
         return Web3(HTTPProvider(rpc, request_kwargs={"timeout": 30}))
 
     # Polygon
@@ -1340,14 +1915,12 @@ def get_web3_for_chain(chain: Optional[str|int]):
         rpc = os.getenv("POLYGON_RPC_URL") or os.getenv("FALLBACK_RPC_URL")
         if not rpc:
             raise RuntimeError("POLYGON_RPC_URL not set")
-        from web3 import Web3, HTTPProvider
         return Web3(HTTPProvider(rpc, request_kwargs={"timeout": 30}))
 
     # fallback to generic RPC env
     rpc = os.getenv("FALLBACK_RPC_URL")
     if not rpc:
         raise RuntimeError("No RPC configured for chain and FALLBACK_RPC_URL is not set")
-    from web3 import Web3, HTTPProvider
     return Web3(HTTPProvider(rpc, request_kwargs={"timeout": 30}))
 
 def _erc20_decimals(web3, token_address: str) -> Optional[int]:
@@ -1357,7 +1930,6 @@ def _erc20_decimals(web3, token_address: str) -> Optional[int]:
     try:
         if not token_address:
             return None
-        from web3 import Web3
         token = Web3.to_checksum_address(token_address)
         erc20_abi = [
             {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
@@ -1446,12 +2018,6 @@ def resolve_basename(name: str) -> str | None:
     Depends on connect_base_web3() existing in the monolith and uses a minimal resolver ABI.
     You may override the resolver address with env var BASE_SEPOLIA_L2RESOLVER or BASE_L2RESOLVER.
     """
-    
-    try:
-        from web3 import Web3
-    except Exception as e:
-        raise RuntimeError("web3.py required for resolve_basename") from e
-
     if not name or not isinstance(name, str):
         return None
 
@@ -2246,11 +2812,6 @@ def create_server_proof_transfer(to_address, amount_native=0.0001, record_as_pay
         {"ok": True, "tx_hash": tx_hash, "payment_id": payment_id_or_None}
         or {"ok": False, "error": "..."}
     """
-    try:
-        from web3 import Web3, HTTPProvider
-    except Exception as e:
-        return {"ok": False, "error": "web3.py is required. Install with: pip install web3", "exc": str(e)}
-
     # RPC
     rpc = os.getenv("BASE_RPC_URL")
     if not rpc:
@@ -2455,11 +3016,6 @@ def forward_to_base_account(dest_str: str, amount_native: float, job_id: str | N
     Returns:
       {"ok": True|False, "tx_hash": str|null, "explorer_url": str|null, "error": str|null}
     """
-    try:
-        from web3 import Web3
-    except Exception as e:
-        return {"ok": False, "error": f"web3/eth-account required: {e}"}
-
     # 1) Resolve basename -> address if necessary
     to_address = None
     try:
@@ -2862,6 +3418,13 @@ class TelegramForwarder:
         self.phone_number = phone_number
         self.user_id = user_id
         self.bot_instance = bot_instance  # Reference to bot for user notifications
+        # Simple in-memory TTL cache used by collectors/backtester integration
+        try:
+            # SimpleTTLCache is provided by backtester module (import present near top of file)
+            self.cache = SimpleTTLCache(maxsize=1024, ttl=300)
+        except Exception:
+            # Fallback to a plain dict if the TTL cache is unavailable
+            self.cache = {}
 
         # MODIFIED to handle demo mode session file
         if is_demo_forwarder:
@@ -2878,6 +3441,9 @@ class TelegramForwarder:
         self.last_forwarded = {}
         self.is_authorized = False
         self.saved_patterns = []
+        # interactive exit-config sessions per user (used by on_exit_value_message)
+        # structure: { user_id: {"stage": "await_value"/"confirm"/..., "draft": {...}} }
+        self.exit_config_sessions = {}
 
         # --- THIS IS THE NEW EVENT HANDLER ---
         # It's registered the moment the object is created.
@@ -2892,24 +3458,238 @@ class TelegramForwarder:
                     # If it's a match, process it immediately.
                     # The existing _process_message method can be reused perfectly.
                     await self._process_message(message, job)
-
+                    
     # Add this new method to the TelegramForwarder class
     async def start(self):
         """Connects the client and runs it until disconnected."""
         logging.info(f"Starting event-driven listener for {self.phone_number}...")
-        # The 'run_until_disconnected' call will block here,
-        # continuously listening for events and triggering the handler.
         await self.client.start()
+
+        # Register runtime handlers (avoid duplicates if start() called multiple times)
+        try:
+            # ensure we don't double-register
+            self.client.remove_event_handler(self._runtime_newmsg_handler) if hasattr(self, "_runtime_newmsg_handler") else None
+        except Exception:
+            pass
+
+        # Bind NewMessage runtime handler (wrap to call your existing processing)
+        async def _runtime_newmsg_handler(event):
+            message = event.message
+            # process existing job-based forwarding
+            for job in self.jobs:
+                if message.chat_id in job.get('source_ids', []):
+                    await self._process_message(message, job)
+            # Also pass message to interactive session message-catcher (on_exit_value_message)
+            await self.on_exit_value_message(event)
+
+        # store reference so we can remove it on stop()
+        self._runtime_newmsg_handler = _runtime_newmsg_handler
+        self.client.add_event_handler(self._runtime_newmsg_handler, events.NewMessage())
+
+        # Register callback query handler for inline buttons
+        async def _runtime_callback_handler(event):
+            # forward to the class method that handles callbacks (implement on_setexit_callback)
+            try:
+                await self.on_setexit_callback(event)
+            except Exception:
+                logging.exception("callback handler error")
+
+        self._runtime_callback_handler = _runtime_callback_handler
+        self.client.add_event_handler(self._runtime_callback_handler, events.CallbackQuery)
+
+        # Run until disconnected
         await self.client.run_until_disconnected()
         logging.info(f"Event-driven listener for {self.phone_number} has stopped.")
 
     # Add this new method to the TelegramForwarder class
     async def stop(self):
-        """Gracefully disconnects the client."""
-        if self.client.is_connected():
+        """Gracefully disconnects the client and unregisters handlers."""
+        try:
+            # remove runtime handlers if present
+            try:
+                if hasattr(self, "_runtime_newmsg_handler"):
+                    self.client.remove_event_handler(self._runtime_newmsg_handler)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_runtime_callback_handler"):
+                    self.client.remove_event_handler(self._runtime_callback_handler)
+            except Exception:
+                pass
+        except Exception:
+            logging.exception("Error while removing handlers")
+
+        # disconnect
+        if self.client and getattr(self.client, "is_connected", lambda: False)():
             logging.info(f"Stopping event-driven listener for {self.phone_number}...")
-            # This will cause 'run_until_disconnected' in the start() method to complete.
             await self.client.disconnect()
+            
+    # ---------- Helper: type buttons ----------
+    @staticmethod
+    def _make_type_buttons():
+        return [
+            [Button.inline("Take Profit", b"exitcfg:type:take_profit")],
+            [Button.inline("Stop Loss", b"exitcfg:type:stop_loss"),
+             Button.inline("Trailing Stop", b"exitcfg:type:trailing_stop")],
+            [Button.inline("ATR Stop", b"exitcfg:type:atr_stop"),
+             Button.inline("Percent of Portfolio", b"exitcfg:type:percent_of_portfolio")]
+        ]
+
+    # ---------- Helper: rule list buttons ----------
+    @staticmethod
+    def _make_rules_list_buttons(rules):
+        # rules is a list of dicts
+        rows = []
+        for i, r in enumerate(rules):
+            rows.append([Button.inline(f"{i+1}. {r.get('type')}", f"exitcfg:edit:{i}".encode())])
+        rows.append([Button.inline("Add New Rule", b"exitcfg:add:0")])
+        return rows
+
+    async def on_setexit_callback(self, event):
+        """Handle inline button callbacks (payload format: 'exitcfg:action:idx')."""
+        try:
+            data = event.data
+            if isinstance(data, bytes):
+                payload = data.decode()
+            else:
+                payload = str(data)
+            parts = payload.split(":")
+            if len(parts) < 3:
+                await event.answer("Invalid action")
+                return
+            # parse action, idx, etc.
+            ctx, action, idx = parts[0], parts[1], parts[2]
+            sender = await event.get_sender()
+            uid = sender.id
+            if action == "add":
+                self.exit_config_sessions[uid] = {"stage": "choose_type", "draft": {}}
+                await event.respond("Choose rule type:", buttons=self._make_type_buttons())
+            elif action == "type":
+                # user selected a type; set draft and prompt for numeric value
+                typ = idx
+                sess = self.exit_config_sessions.get(uid, {"stage": "choose_type", "draft": {}})
+                sess["stage"] = "await_value"
+                sess["draft"]["type"] = typ
+                self.exit_config_sessions[uid] = sess
+                await event.respond(f"Send the numeric value for {typ} (e.g., 2 for 2x take profit).")
+            elif action == "confirm":
+                sess = self.exit_config_sessions.get(uid)
+                if not sess:
+                    await event.respond("No session to confirm.")
+                    return
+                rule = sess.get("draft", {})
+                # persist with helper; this uses save_user_performance_settings_exit_rules introduced earlier
+                save_user_performance_settings_exit_rules(uid, [rule], main_module=globals().get("__name__") and __import__(__name__))
+                self.exit_config_sessions.pop(uid, None)
+                await event.respond("Exit rule saved.")
+            else:
+                await event.respond("Unknown action.")
+        except Exception:
+            logging.exception("on_setexit_callback error")
+            try:
+                await event.respond("An error occurred while handling the button.")
+            except Exception:
+                pass
+            
+    # ---------- START: forwarder wrapper ----------
+    async def collect_signals_for_user_via_forwarder(self,
+                                                      user_id: int,
+                                                      config: Any,
+                                                      max_signals: Optional[int] = None,
+                                                      progress_callback: Optional[Callable[[int, int, Optional[str]], Any]] = None
+                                                      ) -> List[Dict[str, Any]]:
+        """
+        Wrapper that calls the shared collector using this forwarder's bot_instance and helpers.
+
+        - self: this forwarder instance (provides .bot_instance.load_user_data fallback)
+        - user_id: target user id
+        - config: backtest/collector config
+        - max_signals: cap
+        - progress_callback: optional progress callback
+        """
+        # Attempt to import the helper detectors from main_bot, fall back to None
+        try:
+            from main_bot import _find_cashtag as _find_cashtag_fn, _find_ethereum_contract as _find_eth_fn, _find_solana_contract as _find_sol_fn
+        except Exception:
+            _find_cashtag_fn = None
+            _find_eth_fn = None
+            _find_sol_fn = None
+
+        # call collector (this function lives in backtester module)
+        signals = await collect_historical_signals(
+            user_id=user_id,
+            config=config,
+            forwarder=self,
+            data_dir=None,  # prefer forwarder-provided data
+            find_cashtag_fn=_find_cashtag_fn,
+            find_eth_contract_fn=_find_eth_fn,
+            find_solana_contract_fn=_find_sol_fn,
+            max_signals=max_signals,
+            progress_callback=progress_callback
+        )
+        return signals
+    # ---------- END: forwarder wrapper ----------
+
+
+    # ---------- Message handler: capture user-sent values in flow ----------
+    async def on_exit_value_message(self, event):
+        """
+        Register this handler as NewMessage to capture the next user message once the session is in awaiting_value. Capture numeric value after user chose a rule type during interactive flow.
+        """
+        try:
+            sender = await event.get_sender()
+            uid = sender.id
+            message = event.message.message.strip()
+            sess = self.exit_config_sessions.get(uid)
+            if not sess:
+                return  # not in interactive flow
+
+            rule_type = sess["draft"].get("type")
+            if not rule_type:
+                await event.reply("No rule type selected. Please start with /configure_exits.")
+                self.exit_config_sessions.pop(uid, None)
+                return
+
+            # parse depending on type (safe/explicit parsing)
+            candidate = None
+            if rule_type == "take_profit":
+                candidate = {"type": "take_profit", "value": float(message), "multiple_mode": False}
+            elif rule_type == "stop_loss":
+                candidate = {"type": "stop_loss", "value": -abs(float(message))}
+            elif rule_type == "trailing_stop":
+                candidate = {"type": "trailing_stop", "value": float(message)}
+            elif rule_type == "atr_stop":
+                # expect: "<multiplier> <period>" e.g. "2 14"
+                parts = message.split()
+                multiplier = float(parts[0])
+                period = int(parts[1]) if len(parts) > 1 else 14
+                candidate = {"type": "atr_stop", "multiplier": multiplier, "atr_period": period}
+            elif rule_type == "percent_of_portfolio":
+                # expect: "<size_pct> <trigger_pct>" or "50@20"
+                if "@" in message:
+                    size_s, trigger_s = message.split("@", 1)
+                    candidate = {"type": "percent_of_portfolio", "size_pct": float(size_s), "value": float(trigger_s)}
+                else:
+                    parts = message.split()
+                    if len(parts) >= 2:
+                        candidate = {"type": "percent_of_portfolio", "size_pct": float(parts[0]), "value": float(parts[1])}
+                    else:
+                        await event.reply("Invalid format for partial exit. Use: <size_pct> <trigger_pct> or <size_pct>@<trigger_pct>")
+                        return
+            else:
+                await event.reply("Unknown rule type in session; please restart /configure_exits.")
+                self.exit_config_sessions.pop(uid, None)
+                return
+
+            # attach candidate and persist (update drafted session)
+            draft = sess.get("draft", {})
+            draft.update(candidate)
+            sess["draft"] = draft
+            sess["stage"] = "confirm"
+            # Save into user's file if user confirms via callback handler (separate)
+            await event.respond("Draft updated. Use the confirmation buttons to save or edit.", buttons=Button.inline("Confirm", b"exitcfg:confirm:0"))
+        except Exception:
+            logging.exception("on_exit_value_message error")
 
     async def connect_and_authorize(self, phone_code=None, password=None):
         try:
@@ -3487,7 +4267,41 @@ class TelegramForwarder:
 class TelegramBot:
     """Main bot class that handles user interactions."""
     # MODIFIED based on session_fix.txt and user_notification_system.txt
-    def __init__(self):
+    def __init__(self, config: Optional[dict] = None):
+        # --- Ensure bot has a cfg dict used throughout the codebase ---
+        # Accept either the config passed in, or fall back to load_configuration(),
+        # and be robust if load_configuration() returns a tuple/list.
+        if config is None:
+            try:
+                cfg = load_configuration()
+            except Exception:
+                cfg = {}
+        else:
+            cfg = config
+
+        # If loader returned tuple/list like (cfg_dict, meta), extract the first dict-like element
+        if isinstance(cfg, (tuple, list)):
+            found = None
+            for elem in cfg:
+                if isinstance(elem, dict):
+                    found = elem
+                    break
+            if found is not None:
+                cfg = found
+            else:
+                try:
+                    cfg = dict(cfg[0]) if cfg else {}
+                except Exception:
+                    cfg = {}
+
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        # store both names to preserve compatibility across the codebase
+        self.cfg = cfg
+        self.config = cfg
+
+
         # FIXED PATH from session_fix.txt
         bot_session_path = os.path.join(SESSIONS_DIR, 'bot_session')
         self.bot = TelegramClient(bot_session_path, BOT_API_ID, BOT_API_HASH)
@@ -3499,6 +4313,17 @@ class TelegramBot:
 
         # ADDED for Demo Mode
         self.demo_mode = DEMO_MODE
+        # Instantiate demo trader when demo mode is enabled. It's safe if DemoTrader import exists.
+        try:
+            if getattr(self, "demo_mode", False):
+                # DemoTrader is imported from backtester at the top (if available)
+                self.demo_trader = DemoTrader()
+            else:
+                self.demo_trader = None
+        except Exception:
+            # If DemoTrader isn't available or instantiation fails, ensure attribute exists.
+            logging.exception("Failed to instantiate DemoTrader; demo_trader set to None")
+            self.demo_trader = None
         self.demo_forwarder = None
         self.forwarder_tasks = {} # <--- THIS LINE IS ADDED
 
@@ -3749,6 +4574,95 @@ class TelegramBot:
             except Exception:
                 logging.error("Also failed to send failure message to user.", exc_info=True)
             return False
+            
+    # inside an async bot method / handler
+    async def handle_run_backtest_command(self, event, user_id: Optional[int] = None, config: Optional[dict] = None):
+        """
+        Run a backtest for a user and stream progress updates to the chat.
+        - event: the triggering event (has sender_id / chat_id).
+        - user_id: optional target user (defaults to event.sender_id).
+        - config: optional backtester config dict (falls back to defaults).
+        This method tries to call an async backtester coroutine first; if the backtester
+        function is synchronous it will run it in a ThreadPoolExecutor as a fallback.
+        """
+        # Resolve chat and user
+        caller_chat = getattr(event, "chat_id", None) or getattr(event, "sender_id", None)
+        target_user = user_id or getattr(event, "sender_id", None)
+
+        # Send a status message we'll attempt to edit with progress updates
+        status_msg = None
+        status_msg_id = None
+        try:
+            status_msg = await self.bot.send_message(caller_chat, "🔎 Starting backtest — scanning messages...")
+            # Telethon may use .id or .message_id depending on wrapper
+            status_msg_id = getattr(status_msg, "id", None) or getattr(status_msg, "message_id", None)
+        except Exception:
+            status_msg = None
+            status_msg_id = None
+
+        # Create UI progress callback that will edit the status message (if possible)
+        progress_cb = make_progress_callback_for_telegram(self.bot, caller_chat, status_message_id=status_msg_id, throttle_seconds=1.0)
+
+        # Default config fallback
+        if config is None:
+            config = {
+                "max_history_days": globals().get("BACKTEST_MAX_HISTORY_DAYS", 30),
+                "collect_limit": globals().get("BACKTEST_COLLECT_LIMIT", 500)
+            }
+
+        # Run the backtester. Try async first, then sync fallback via run_in_executor.
+        try:
+            # Prefer an async coroutine if available
+            result = await collect_historical_signals(user_id=target_user, config=config, progress_callback=progress_cb)
+        except TypeError:
+            # collect_historical_signals may be a sync function -> run it in executor
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: collect_historical_signals(user_id=target_user, config=config, progress_callback=progress_cb))
+        except NameError:
+            # If the above function name is different in your backtester, try other candidate names
+            try:
+                result = await run_backtest_for_user(user_id=target_user, config=config, progress_callback=progress_cb)
+            except Exception as e:
+                await self.bot.send_message(caller_chat, f"❌ Backtest failed to start: {e}")
+                try:
+                    if status_msg_id:
+                        await self.bot.delete_messages(caller_chat, status_msg_id)
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            # General failure starting the backtest
+            try:
+                await self.bot.send_message(caller_chat, f"❌ Backtest failed to start: {e}")
+            except Exception:
+                pass
+            try:
+                if status_msg_id:
+                    await self.bot.delete_messages(caller_chat, status_msg_id)
+            except Exception:
+                pass
+            return
+
+        # Format & deliver the final summary
+        try:
+            summary_text = format_backtest_summary(result)
+            # If format_backtest_summary returns a dict (older fallback), convert to string
+            if isinstance(summary_text, dict):
+                summary_text = str(summary_text)
+            await self.bot.send_message(caller_chat, summary_text, parse_mode='html')
+        except Exception:
+            try:
+                await self.bot.send_message(caller_chat, f"Backtest completed. Raw result: {result}")
+            except Exception:
+                pass
+
+        # Clean up status message
+        try:
+            if status_msg_id:
+                await self.bot.delete_messages(caller_chat, status_msg_id)
+        except Exception:
+            pass
+
 
     async def admin_generate_revenue_report(self, event):
         """Generates a CSV report of revenue segmented by month from payment history."""
@@ -3980,7 +4894,6 @@ Please send the **private key** for your trading wallet. This message will be de
     # This wrapper uses PROMPT_MAP above and will not override an existing _show_prompt_for_state_fallback.
     if 'show_prompt_for_state' not in globals():
         async def _show_prompt_for_state_fallback(event, state, extra_info=None):
-            from telethon import Button
             txt = PROMPT_MAP.get(state)
             if extra_info:
                 if txt:
@@ -4431,10 +5344,171 @@ Please send the **private key** for your trading wallet. This message will be de
         except Exception as e:
             logging.error(f"Failed to create promo code: {e}", exc_info=True)
             await event.reply("❌ An error occurred while trying to create the code.")
+            
+    async def run_backtest_for_user_and_report(self, event, user_id: Optional[int] = None, config: Optional[dict] = None, mode: str = "full"):
+        """
+        Bot-side wrapper that drives backtester and reports progress/results to Telegram.
+
+        mode:
+          - "full" : call backtester.run_backtest_for_user(...) (preferred; end-to-end)
+          - "collect" : call backtester.collect_historical_signals(...) only, return signals
+          - "collect_and_simulate": collect -> resolve -> fetch series -> attempt simulation (if backtester exposes helpers)
+
+        Place inside TelegramBot class so it can use self.bot, self.cfg, etc.
+        """
+        import importlib, asyncio, logging
+        backtester = importlib.import_module("backtester")
+
+        # determine chat/user
+        chat_id = getattr(event, "chat_id", getattr(event, "sender_id", None))
+        if user_id is None:
+            user_id = getattr(event, "sender_id", None)
+
+        # sensible defaults
+        if config is None:
+            config = {
+                "max_history_days": self.cfg.get("backtester", {}).get("max_history_days", 7),
+                "collect_limit": self.cfg.get("backtester", {}).get("collect_limit", 500),
+                "exit_rules": self.cfg.get("performance_settings", {}).get("exit_rules", []),
+                "min_market_cap": self.cfg.get("performance_settings", {}).get("min_market_cap", 0),
+            }
+
+        # create status message to edit during progress
+        status_message_id = None
+        try:
+            status_msg = await self.bot.send_message(chat_id, "🔎 Backtest started — collecting signals...")
+            status_message_id = getattr(status_msg, "id", None)
+        except Exception:
+            status_message_id = None
+
+        # progress callback bound to this bot/chat/message
+        cb = make_progress_callback_for_telegram(self.bot, chat_id, status_message_id=status_message_id, throttle_seconds=1.0)
+
+        result = None
+
+        # ---------- MODE: full -> prefer run_backtest_for_user ----------
+        if mode == "full":
+            if hasattr(backtester, "run_backtest_for_user"):
+                engine_fn = getattr(backtester, "run_backtest_for_user")
+                try:
+                    if asyncio.iscoroutinefunction(engine_fn):
+                        result = await engine_fn(user_id=user_id, config=config, forwarder=getattr(self, "user_forwarders", {}).get(user_id), progress_callback=cb)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        result = await loop.run_in_executor(None, lambda: engine_fn(user_id, config, None, None, None, cb))
+                except Exception as e:
+                    logging.exception("Error calling run_backtest_for_user")
+                    result = {"error": str(e)}
+            else:
+                # fallback: if run_backtest_for_user missing, run collect+simulate if possible
+                mode = "collect_and_simulate"  # fall through to that path
+
+        # ---------- MODE: collect only ----------
+        if mode == "collect":
+            if hasattr(backtester, "collect_historical_signals"):
+                collect_fn = getattr(backtester, "collect_historical_signals")
+                try:
+                    if asyncio.iscoroutinefunction(collect_fn):
+                        signals = await collect_fn(user_id=user_id, config=config, forwarder=getattr(self, "user_forwarders", {}).get(user_id), max_signals=config.get("collect_limit"), progress_callback=cb)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        signals = await loop.run_in_executor(None, lambda: collect_fn(user_id, config, getattr(self, "user_forwarders", {}).get(user_id), None, None, None, None, config.get("collect_limit"), cb))
+                    result = {"collected_signals_count": len(signals), "collected_signals": signals}
+                except Exception as e:
+                    logging.exception("Error during collect_historical_signals")
+                    result = {"error": str(e)}
+            else:
+                result = {"error": "collect_historical_signals not available in backtester"}
+
+        # ---------- MODE: collect_and_simulate (explicit) ----------
+        if mode == "collect_and_simulate":
+            try:
+                # 1) collect
+                if not hasattr(backtester, "collect_historical_signals"):
+                    raise RuntimeError("collect_historical_signals not available")
+                collect_fn = getattr(backtester, "collect_historical_signals")
+                if asyncio.iscoroutinefunction(collect_fn):
+                    raw_signals = await collect_fn(user_id=user_id, config=config, forwarder=getattr(self, "user_forwarders", {}).get(user_id), max_signals=config.get("collect_limit"), progress_callback=cb)
+                else:
+                    loop = asyncio.get_running_loop()
+                    raw_signals = await loop.run_in_executor(None, lambda: collect_fn(user_id, config, getattr(self, "user_forwarders", {}).get(user_id), None, None, None, None, config.get("collect_limit"), cb))
+
+                # 2) resolve prices
+                if not hasattr(backtester, "validate_and_resolve_signals"):
+                    raise RuntimeError("validate_and_resolve_signals not available")
+                resolve_fn = getattr(backtester, "validate_and_resolve_signals")
+                cache = getattr(backtester, "SimpleTTLCache", None)() if getattr(backtester, "SimpleTTLCache", None) else None
+                if asyncio.iscoroutinefunction(resolve_fn):
+                    resolved = await resolve_fn(signals=raw_signals, market_api=None, cache=cache, cache_ttl=300)
+                else:
+                    loop = asyncio.get_running_loop()
+                    resolved = await loop.run_in_executor(None, lambda: resolve_fn(signals=raw_signals, market_api=None, cache=cache, cache_ttl=300))
+
+                # 3) fetch series (if available)
+                if hasattr(backtester, "fetch_price_series_for_signals"):
+                    fps_fn = getattr(backtester, "fetch_price_series_for_signals")
+                    if asyncio.iscoroutinefunction(fps_fn):
+                        resolved_with_series = await fps_fn(resolved, market_api=None, lookahead_seconds=86400)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        resolved_with_series = await loop.run_in_executor(None, lambda: fps_fn(resolved, market_api=None, lookahead_seconds=86400))
+                else:
+                    resolved_with_series = resolved
+
+                # 4) attempt simulator
+                if hasattr(backtester, "_attempt_call_existing_simulator"):
+                    sim_fn = getattr(backtester, "_attempt_call_existing_simulator")
+                    if asyncio.iscoroutinefunction(sim_fn):
+                        sim_results = await sim_fn(resolved_with_series, config)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        sim_results = await loop.run_in_executor(None, lambda: sim_fn(resolved_with_series, config))
+                else:
+                    sim_results = {"error": "simulator not available"}
+
+                result = {
+                    "raw_signals_count": len(raw_signals),
+                    "resolved_signals_count": len([s for s in resolved if s.get("resolved")]),
+                    "raw_signals": raw_signals,
+                    "resolved_signals": resolved,
+                    "resolved_with_series": resolved_with_series,
+                    "results": sim_results
+                }
+            except Exception as e:
+                logging.exception("collect_and_simulate failed")
+                result = {"error": str(e)}
+
+        # ---------- Format & send summary ----------
+        try:
+            summary = format_backtest_summary(result)
+        except Exception as e:
+            summary = f"Backtest finished but formatting failed: {e}"
+
+        try:
+            if status_message_id and hasattr(self.bot, "edit_message"):
+                try:
+                    await self.bot.edit_message(chat_id, status_message_id, summary)
+                except Exception:
+                    await self.bot.send_message(chat_id, summary)
+            else:
+                await self.bot.send_message(chat_id, summary)
+        except Exception:
+            logging.exception("Failed to send backtest summary")
+
+        return result
+
 
     async def start_bot(self):
         await self.bot.start(bot_token=BOT_TOKEN)
         print("🤖 Bot started successfully!")
+               
+        # Start DemoTrader background scheduler if present
+        if getattr(self, "demo_trader", None):
+            try:
+                await self.demo_trader.start()
+                logging.info("DemoTrader started from start_bot()")
+            except Exception:
+                logging.exception("Failed to start demo_trader in start_bot")
 
         @self.bot.on(events.NewMessage)
         async def handle_message(event):
@@ -4568,6 +5642,44 @@ Please send the **private key** for your trading wallet. This message will be de
             ]
 
             await event.reply(message, buttons=buttons)
+            
+        @self.bot.on(events.NewMessage(pattern=r"^/backtest(?:\s+(\w+))?"))
+        async def _on_backtest_cmd(event):
+            m = re.match(r"^/backtest(?:\s+(\w+))?", event.raw_text)
+            mode = m.group(1) if m and m.group(1) else "full"
+            await self.run_backtest_for_user_and_report(event, mode=mode)
+            
+        @self.bot.on(events.NewMessage(pattern=r"^📊 Performance & Backtest$"))
+        async def _on_performance_menu(event):
+            try:
+                await self.show_performance_menu(event)
+            except Exception:
+                # fallback reply
+                await event.reply("Failed to open Performance menu. Try /backtest to run a backtest.")
+                
+###
+        @self.bot.on(events.NewMessage(pattern=r"^/start_demo"))
+        async def _on_start_demo_cmd(event):
+            if getattr(self, "demo_trader", None):
+                try:
+                    await self.demo_trader.start()
+                    await event.reply("DemoTrader started.")
+                except Exception as e:
+                    await event.reply(f"Failed to start DemoTrader: {e}")
+            else:
+                await event.reply("DemoTrader is not configured on this instance.")
+
+        @self.bot.on(events.NewMessage(pattern=r"^/stop_demo"))
+        async def _on_stop_demo_cmd(event):
+            if getattr(self, "demo_trader", None):
+                try:
+                    await self.demo_trader.stop()
+                    await event.reply("DemoTrader stopped.")
+                except Exception as e:
+                    await event.reply(f"Failed to stop DemoTrader: {e}")
+            else:
+                await event.reply("DemoTrader is not configured on this instance.")
+###
 
         @self.bot.on(events.NewMessage(pattern='/referral'))
         async def referral_command(event):
@@ -4909,8 +6021,6 @@ Please send the **private key** for your trading wallet. This message will be de
                 await event.reply(f"`{name}` → `{addr}`")
             else:
                 await event.reply(f"Could not resolve `{name}` (no record or zero-address).")
-
-
     # -----------------------------------------------------------------------------
     # --- PAGINATION SYSTEM ---
     # -----------------------------------------------------------------------------
@@ -5239,15 +6349,12 @@ Please send the **private key** for your trading wallet. This message will be de
         # --- FINAL FIX: CHECK ALL UNIVERSAL AND MENU BUTTONS FIRST ---
         # This list now includes buttons from the main menu, admin menu, and other settings.
         all_menu_buttons = [
-            "📋 Manage Jobs", "📝 List Chats", "🔄 Reconnect Account", "🚪 Logout (Keep Jobs)", "⚙️ Other Settings", "🔷 Base",
-            "👥 View All Users", "📋 View All Jobs", "📊 System Statistics", "💬 View All Chats",
-            "🎁 Create Promo Code", "🗑️ Admin Delete Jobs", "👤 Manage Users", "🔙 Exit Admin Mode",
-            "🚀 Subscribe", "🤝 Referral", "🎁 Redeem Code", "🗑️ Delete Account"
+            "📋 Manage Jobs", "📝 List Chats", "🔄 Reconnect Account", "🚪 Logout (Keep Jobs)", "⚙️ Other Settings", "🔷 Base", "📊 Performance & Backtest", "👥 View All Users", "📋 View All Jobs", "📊 System Statistics", "💬 View All Chats", "🎁 Create Promo Code", "🗑️ Admin Delete Jobs", "👤 Manage Users", "🔙 Exit Admin Mode", "🚀 Subscribe", "🤝 Referral", "🎁 Redeem Code", "🗑️ Delete Account"
         ]
 
         # If the message is a recognized menu button, route it correctly regardless of the current state.
         if message in all_menu_buttons:
-            if message in ["📋 Manage Jobs", "📝 List Chats", "🔄 Reconnect Account", "🚪 Logout (Keep Jobs)", "⚙️ Other Settings", "🔷 Base"]:
+            if message in ["📋 Manage Jobs", "📝 List Chats", "🔄 Reconnect Account", "🚪 Logout (Keep Jobs)", "⚙️ Other Settings", "📊 Performance & Backtest", "🔷 Base"]:
                 await self.handle_main_menu(event, message)
                 return
             elif session.is_admin and message in ["👥 View All Users", "📋 View All Jobs", "📊 System Statistics", "💬 View All Chats", "🎁 Create Promo Code", "🗑️ Admin Delete Jobs", "👤 Manage Users", "🔙 Exit Admin Mode"]:
@@ -5980,6 +7087,7 @@ Please send the **private key** for your trading wallet. This message will be de
                 [Button.text("🔄 Reconnect Account", resize=True)],
                 [Button.text("🚪 Logout (Keep Jobs)", resize=True)],
                 [Button.text("🔷 Base", resize=True)],
+                [Button.text("📊 Performance & Backtest", resize=True)],
                 # The "Delete Account" button is replaced with "Other Settings"
                 [Button.text("⚙️ Other Settings", resize=True)]
             ]
@@ -5996,6 +7104,65 @@ Please send the **private key** for your trading wallet. This message will be de
             ]
         #
         await event.reply(menu_text, buttons=buttons)
+        
+    async def show_performance_menu(self, event):
+        """
+        A simple performance menu that offers backtest and demo-trader controls.
+        Triggered when the user taps '📊 Performance & Backtest' in the main menu.
+        """
+        # two-row layout: Backtest / Demo / Exits / Back
+        buttons = [
+            [Button.text("▶️ Run Backtest", resize=True), Button.text("🧪 Demo Trading", resize=True)],
+            [Button.text("⚙️ Configure Exit Rules", resize=True), Button.text("⬅️ Back", resize=True)]
+        ]
+        try:
+            await event.reply("📊 Performance & Backtest — choose an action:", buttons=buttons)
+        except Exception:
+            try:
+                await event.respond("📊 Performance & Backtest — choose an action:")
+            except Exception:
+                await self.bot.send_message(getattr(event, "chat_id", getattr(event, "sender_id", None)),
+                                            "📊 Performance & Backtest — please type one of:\n▶️ Run Backtest\n🧪 Demo Trading\n⚙️ Configure Exit Rules")
+
+    async def handle_performance_menu_choice(self, event):
+        """
+        Handles button text results from the performance menu.
+        This will be called from your existing message dispatcher (handle_user_message)
+        when event.raw_text matches the button label.
+        """
+        text = (getattr(event, "raw_text", "") or "").strip()
+        if text == "▶️ Run Backtest":
+            # directly call existing backtest runner
+            await self.handle_run_backtest_command(event)
+        elif text == "🧪 Demo Trading":
+            # Toggle or show demo trader menu
+            if getattr(self, "demo_trader", None):
+                try:
+                    # Example: show demo status and buttons
+                    await event.reply("Demo Trader actions:\n• Start\n• Stop\n• Status", buttons=[
+                        [Button.text("▶️ Start Demo", resize=True), Button.text("⏹ Stop Demo", resize=True)],
+                        [Button.text("⬅️ Back", resize=True)]
+                    ])
+                except Exception:
+                    await event.reply("Demo Trader actions: Start / Stop / Status")
+            else:
+                await event.reply("DemoTrader not configured on this instance.")
+        elif text == "⚙️ Configure Exit Rules":
+            # reuse existing exit configuration flows if present; try to call a handler
+            # If you have an interactive exit flow use that; otherwise fall back to /setexit
+            try:
+                # set the session state to the exit-config flow, if you have it
+                session = await self.get_user_session(event.sender_id)
+                session.set_state("awaiting_exit_rule")  # if your state machine uses this
+                await self.show_prompt_for_state(event, "awaiting_redeem_code")  # example; adapt to your state names
+            except Exception:
+                # fallback instruction
+                await event.reply("To configure an exit rule, use the command:\n`/setexit tp:2` (for 2% TP) or `/setexit sl:10`")
+        elif text == "⬅️ Back":
+            await self.send_main_menu(event)
+        else:
+            await event.reply("Unknown selection. Please use the menu buttons.")
+
 
     async def show_base_menu(self, event):
         """
@@ -6100,8 +7267,6 @@ Please send the **private key** for your trading wallet. This message will be de
         # Fallback
         await event.reply("Please use one of the Base submenu buttons.")
 
-
-    # REPLACED based on fixed_disconnect_logic.txt
     async def handle_main_menu(self, event, message):
         if message == "🔗 Connect Account":
             await self.start_account_setup(event)
@@ -6111,6 +7276,9 @@ Please send the **private key** for your trading wallet. This message will be de
             await self.list_user_chats(event)
         elif message == "🔄 Reconnect Account":
             await self.start_account_setup(event)
+            # Show performance submenu
+        elif message == "📊 Performance & Backtest":
+            await self.show_performance_menu(event)
         elif message == "🚪 Logout (Keep Jobs)":
             await self.logout_account(event)
         elif message == "⚙️ Other Settings":
@@ -7075,7 +8243,6 @@ Send the number (1-5) or type the job type name.""")
                 if resolved_address.startswith("0x") and len(resolved_address) == 42:
                      try:
                          # Optional: Use web3 checksumming if available
-                         from web3 import Web3
                          resolved_address = Web3.toChecksumAddress(resolved_address)
                          is_valid_format = True
                      except ImportError:
@@ -7749,6 +8916,26 @@ Here are some ready-to-use descriptions you can copy for the `[Describe the text
             title="📝 Your Accessible Chats",
             items_per_page=10
         )
+        
+    # async def on_setexit(event: 'events.NewMessage.Event'):
+        # # expects: /setexit <json or shorthand>
+        # try:
+            # sender = await event.get_sender()
+            # user_id = sender.id
+            # text = event.message.message
+            # # remove command prefix
+            # raw = text.partition(" ")[2].strip()
+            # if not raw:
+                # await event.reply("Usage: /setexit <JSON or shorthand>")
+                # return
+            # rule = parse_exit_rule_from_text(raw)
+            # # save
+            # # Since we're in same process, pass the module object or import by path
+            # save_user_performance_settings_exit_rules(user_id, [rule], main_module=globals().get("__name__") and __import__(__name__))
+            # await event.reply("Exit rule saved:\n" + render_exit_rules_human([rule]))
+        # except Exception as e:
+            # logging.exception("on_setexit error")
+            # await event.reply(f"Failed to save exit rule: {e}")
 
     # ADDED
     async def logout_account(self, event):
@@ -9078,7 +10265,6 @@ def register_bot_payment_handlers(bot_instance):
 
         # convert native amount to wei (18 decimals)
         try:
-            from decimal import Decimal, InvalidOperation
             value_wei = int(Decimal(str(amount_native)) * Decimal(10 ** 18))
         except (InvalidOperation, Exception) as e:
             await event.reply(f"Invalid amount: {e}")
@@ -9223,19 +10409,63 @@ def register_bot_payment_handlers(bot_instance):
 
 
 async def main():
-    """Main function to start the bot."""
+    """Main function to start the bot (merged with migration + new startup behaviors)."""
     print("🤖 **Enhanced Telegram Forwarder Bot**")
     print("=" * 50)
 
-    bot = TelegramBot()
-    register_bot_payment_handlers(bot)
-    
+    # Load runtime configuration (new merged loader)
+    # Load configuration in a robust manner (handle older loaders that may return tuples)
+    try:
+        cfg = load_configuration()
+    except Exception:
+        cfg = {}
+
+    # If load_configuration returned a tuple like (cfg_dict, meta) or (cfg_dict, errors),
+    # extract the first dict-like element so downstream code can use cfg.get(...)
+    if isinstance(cfg, tuple) or isinstance(cfg, list):
+        # prefer the first dict-like item found
+        found = None
+        for elem in cfg:
+            if isinstance(elem, dict):
+                found = elem
+                break
+        if found is not None:
+            cfg = found
+        else:
+            # fallback: try to convert the first element to a dict if possible
+            try:
+                cfg = dict(cfg[0]) if cfg else {}
+            except Exception:
+                cfg = {}
+
+    # last sanity: ensure cfg is a dict
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    # Now read values with safe defaults
+    DEMO_MODE = cfg.get("DEMO_MODE", False)
+    DATA_DIR = cfg.get("DATA_DIR", os.path.join(get_base_path(), "data"))
+    SUBSCRIPTION_ENABLED = cfg.get("SUBSCRIPTION_ENABLED", False)
+    WEBHOOK_PORT = int(cfg.get("WEBHOOK_PORT", os.environ.get("WEBHOOK_PORT", 8000)))
+    MIGRATE_ON_START = cfg.get("MIGRATE_ON_START", False)
+
+    # Instantiate bot with config (patched TelegramBot expects cfg)
+    bot = TelegramBot(cfg) if "TelegramBot" in globals() else TelegramBot()
+    # register payment handlers as your original flow required
+    try:
+        register_bot_payment_handlers(bot)
+    except Exception:
+        # keep compatibility if register function not present
+        logging.debug("register_bot_payment_handlers not available or failed", exc_info=True)
+
     # --- PAYMENT DB INIT (INSERT BELOW `bot = TelegramBot()` in async def main()) ---
     # Ensure psycopg2 is installed on the server (pip install psycopg2-binary)
     try:
-        pass
+        # original placeholder: keep the intent — if you intend to allow Postgres, check env and import psycopg2 here
+        if os.environ.get("USE_POSTGRES_PAYMENTS", "false").lower() in ("1", "true", "yes"):
+            import psycopg2  # may raise ImportError if not installed
     except Exception as e:
-        raise RuntimeError("psycopg2 is required for payments DB. Install with: pip install psycopg2-binary") from e
+        raise RuntimeError("psycopg2 is required for Postgres payments DB. Install with: pip install psycopg2-binary") from e
 
     # File-backed payments store startup (no Postgres required)
     globals()['bot_instance'] = bot
@@ -9247,47 +10477,98 @@ async def main():
     except Exception as e:
         raise RuntimeError(f"Failed to initialize file-backed payments store: {e}")
     # --- END PAYMENT DB INIT ---
-    init_user_profiles_db()
-    asyncio.create_task(wallet_poll_loop())
+
+    # Initialize user profiles DB (existing function in your code)
+    try:
+        init_user_profiles_db()
+    except Exception as e:
+        logging.exception("Failed to initialize user profiles DB")
+        # Continue because bot can still run with limited features
+
+    # Start periodic wallet polling loop as background task (existing coroutine)
+    try:
+        asyncio.create_task(wallet_poll_loop())
+    except Exception:
+        logging.exception("Failed to start wallet_poll_loop; continuing without it")
+
     # --- START: start reconcile thread now that helpers are defined ---
     try:
-        # create the reconcile thread (defined at module-level by _create_reconcile_thread)
         reconcile_thread = None
         if '_create_reconcile_thread' in globals():
             reconcile_thread = _create_reconcile_thread(poll_interval_seconds=300)
-            # start it now that init_payments_db() and _load_payments_store() exist
             reconcile_thread.start()
             print("🔁 Background reconcile thread started.")
         else:
             print("⚠️ _create_reconcile_thread not found; reconcile thread not started.")
     except Exception as e:
         print(f"⚠️ Failed to start reconcile thread: {e}")
+    # --- END reconcile thread setup ---
 
     # --- START OF NEW WEBHOOK LOGIC ---
-    if SUBSCRIPTION_ENABLED:
-        # Run the FastAPI server in a separate thread.
-        # daemon=True ensures the thread will close when the main script exits.
-        webhook_thread = threading.Thread(
-            target=bot.run_webhook_server,
-            daemon=True
-        )
-        webhook_thread.start()
-        print(f"🚀 Webhook server listening on http://0.0.0.0:{WEBHOOK_PORT}...")
+    try:
+        if SUBSCRIPTION_ENABLED:
+            # Run the FastAPI server in a separate thread (bot.run_webhook_server should be non-blocking)
+            webhook_thread = threading.Thread(
+                target=getattr(bot, "run_webhook_server", lambda: None),
+                daemon=True,
+            )
+            webhook_thread.start()
+            print(f"🚀 Webhook server listening on http://0.0.0.0:{WEBHOOK_PORT}...")
+    except Exception:
+        logging.exception("Failed to start webhook thread")
     # --- END OF NEW WEBHOOK LOGIC ---
 
+    # Optionally run data migration (blocking work run in executor so we don't block the event loop)
+    if MIGRATE_ON_START:
+        try:
+            print("🔧 Running data migration on startup (MIGRATE_ON_START=True)...")
+            loop = asyncio.get_event_loop()
+            # run_migrate_all_users is synchronous (as implemented); run in default executor
+            def _migrate():
+                return run_migrate_all_users(
+                    data_dir=DATA_DIR,
+                    crypto_factory=lambda uid: CryptoManager(uid),
+                    dry_run=False,
+                    progress_callback=None
+                )
+            migrate_result = await loop.run_in_executor(None, _migrate)
+            print("✅ Data migration completed:", migrate_result)
+        except Exception:
+            logging.exception("Migration failed during startup")
+
     try:
-        # MODIFIED: Choose startup routine based on DEMO_MODE
+        # Choose startup routine based on DEMO_MODE
         if DEMO_MODE:
-            await bot.setup_demo_mode()
+            # Setup demo mode (no external forwarder sessions)
+            if hasattr(bot, "setup_demo_mode"):
+                await bot.setup_demo_mode()
+            else:
+                logging.warning("Demo mode requested but bot.setup_demo_mode is not available.")
         else:
-            await bot.restore_user_sessions()
+            # Restore user sessions (starts forwarders)
+            if hasattr(bot, "restore_user_sessions"):
+                await bot.restore_user_sessions()
+            else:
+                # older codepath: some forks have start() or start_bot(); fall back to start_bot if defined
+                if hasattr(bot, "start_bot"):
+                    await bot.start_bot()
 
         print("🚀 Bot is ready and listening for messages...")
         print("📱 Users can start chatting with the bot!")
         print("🔧 Admins can use /admin <master_secret> for admin access")
         print("=" * 50)
 
-        await bot.start_bot()
+        # Start the longer-running main bot loop / runner if provided
+        if hasattr(bot, "start_bot"):
+            try:
+                await bot.start_bot()
+            except TypeError:
+                # start_bot may be synchronous or accept different signature; skip if incompatible
+                logging.debug("bot.start_bot() exists but invocation failed; continuing.")
+        else:
+            # If no start_bot, keep process alive (the forwarders should be running)
+            # Sleep indefinitely (or until cancelled) to keep the asyncio program running
+            await asyncio.Event().wait()
 
     except Exception as e:
         logging.critical(f"A critical error occurred during bot startup or operation: {e}", exc_info=True)
