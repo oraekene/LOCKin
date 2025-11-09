@@ -901,6 +901,9 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
     Try to find an existing simulation/backtest function inside this module or imported modules.
     Looks for common names and calls the first matching one with (resolved_signals, config).
     If none exists, falls back to a minimal internal simulator (simple P&L per-signal).
+
+    This merged version preserves the original behavior (series lookup via resolved_with_series,
+    _simulate_with_rules, and original result fields), and keeps the dedup & cooldown improvements.
     """
     # common candidate function names your repo might already have
     candidates = [
@@ -918,12 +921,16 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
         if fn and callable(fn):
             logging.info(f"[backtester] using existing simulator function: {name}")
             # support async or sync functions
-            if inspect.iscoroutinefunction(fn):
-                return await fn(resolved_signals, config)
-            else:
-                # run sync function in executor to avoid blocking
-                loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(None, lambda: fn(resolved_signals, config))
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    return await fn(resolved_signals, config)
+                else:
+                    # run sync function in executor to avoid blocking
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(None, lambda: fn(resolved_signals, config))
+            except Exception:
+                # if a candidate fails, continue to next candidate
+                pass
 
     # 2) Try to import common backtest runner modules (best-effort, non-fatal)
     try:
@@ -1002,7 +1009,10 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
         """
         if not series:
             # no ticks -> assume immediate +10% exit as fallback
-            return (entry_price * 1.10, 0, "fallback_fixed")
+            try:
+                return (float(entry_price) * 1.10, 0, "fallback_fixed")
+            except Exception:
+                return (entry_price, 0, "fallback_fixed")
 
         # normalize series to list of floats
         prices = []
@@ -1012,12 +1022,21 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
             except Exception:
                 continue
         if not prices:
-            return (entry_price * 1.10, 0, "fallback_fixed")
+            try:
+                return (float(entry_price) * 1.10, 0, "fallback_fixed")
+            except Exception:
+                return (entry_price, 0, "fallback_fixed")
 
         for idx, price in enumerate(prices, start=1):
             # compute metrics relative to entry
-            multiple = price / entry_price if entry_price != 0 else float("inf")
-            profit_pct = (price - entry_price) / entry_price * 100.0 if entry_price != 0 else float("inf")
+            try:
+                multiple = price / entry_price if entry_price != 0 else float("inf")
+            except Exception:
+                multiple = float("inf")
+            try:
+                profit_pct = (price - entry_price) / entry_price * 100.0 if entry_price != 0 else float("inf")
+            except Exception:
+                profit_pct = float("inf")
 
             # check stop loss first (close early on loss)
             for r in rules or []:
@@ -1064,9 +1083,55 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
 
     # Run simulation across signals
     results = {"positions": [], "summary": {"total_signals": len(resolved_signals), "closed": 0, "pnl": 0.0}}
+
+    # Minimal internal simulator: iterate resolved signals, find entry, run through price series, apply rules
     for s in resolved_signals:
         if not s.get("resolved"):
             continue
+
+        # ---------- dedup & cooldown (minimal run-local implementation) ----------
+        try:
+            now_ts = int(time.time())
+            # normalized identifier (lowercase)
+            identifier_lower = str(s.get("resolved_symbol") or s.get("identifier") or s.get("symbol") or s.get("contract") or "").lower()
+            job_id_local = s.get("source_job_id") or "backtest"
+            # dedup window (seconds) applied across the whole run
+            dedup_window = int((config.get("dedup_window_seconds") if isinstance(config, dict) else None) or 0)
+            # cooldown per asset (seconds) applied per job_id + identifier
+            cooldown_seconds = int((config.get("cooldown_seconds_per_asset") if isinstance(config, dict) else None) or 0)
+        except Exception:
+            dedup_window = 0
+            cooldown_seconds = 0
+            now_ts = int(time.time())
+            identifier_lower = str(s.get("identifier") or s.get("symbol") or "").lower()
+            job_id_local = s.get("source_job_id") or "backtest"
+
+        # initialize run-local maps if not present (attached to the function object)
+        if not hasattr(_attempt_call_existing_simulator, '_seen_identifiers'):
+            setattr(_attempt_call_existing_simulator, '_seen_identifiers', {})
+        if not hasattr(_attempt_call_existing_simulator, '_last_triggered'):
+            setattr(_attempt_call_existing_simulator, '_last_triggered', {})
+        seen_identifiers = getattr(_attempt_call_existing_simulator, '_seen_identifiers')
+        last_triggered = getattr(_attempt_call_existing_simulator, '_last_triggered')
+
+        # dedup check
+        if dedup_window:
+            last = seen_identifiers.get(identifier_lower)
+            if last and (now_ts - int(last)) < dedup_window:
+                # skip this signal as duplicate within dedup window
+                continue
+            seen_identifiers[identifier_lower] = now_ts
+
+        # cooldown per asset check
+        if cooldown_seconds:
+            key = f"{job_id_local}:{identifier_lower}"
+            last = last_triggered.get(key)
+            if last and (now_ts - int(last)) < cooldown_seconds:
+                # skip due to cooldown
+                continue
+            last_triggered[key] = now_ts
+        # ---------- end dedup & cooldown ----------
+
         entry = s.get("resolved_price") or s.get("entry_price")
         if entry is None:
             # can't simulate without an entry price
@@ -1076,14 +1141,19 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
         series = _get_series_for_signal(s)
         exit_price, exit_idx, reason = _simulate_with_rules(entry, series, parsed_rules)
 
-        pnl = (exit_price - entry) / entry if entry != 0 else 0.0
+        try:
+            pnl = (exit_price - entry) / entry if entry != 0 else 0.0
+        except Exception:
+            pnl = 0.0
+
+        # preserve original result keys and metadata so callers remain compatible
         results["positions"].append({
             "identifier": s.get("identifier") or s.get("id") or s.get("symbol"),
             "symbol": s.get("symbol"),
-            "entry_price": entry,
-            "exit_price": exit_price,
+            "entry_price": float(entry),
+            "exit_price": float(exit_price),
             "pnl": pnl,
-            "exit_index": exit_idx,
+            "exit_index": int(exit_idx),
             "exit_reason": reason,
             "resolved_provider": s.get("resolved_provider"),
             "detected_at": s.get("detected_at")
@@ -1092,6 +1162,7 @@ async def _attempt_call_existing_simulator(resolved_signals: List[Dict[str, Any]
         results["summary"]["pnl"] += pnl
 
     return results
+
 
 
 async def run_backtest_for_user(user_id: int,

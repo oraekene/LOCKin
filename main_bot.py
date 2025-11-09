@@ -315,13 +315,16 @@ def load_configuration():
 
     # Migration / startup behavior
     MIGRATE_ON_START = parse_bool(os.getenv("MIGRATE_ON_START"), default=False)
+    
+    # New: advanced backtest UI feature flag (default False)
+    ENABLE_ADVANCED_BACKTEST_UI = parse_bool(os.getenv("ENABLE_ADVANCED_BACKTEST_UI"), default=False)
 
     # Return original tuple (keeps compatibility with existing unpacking)
     return (MASTER_SECRET, BOT_TOKEN, BOT_API_ID, BOT_API_HASH, DEMO_MODE,
             DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME)
 
 (MASTER_SECRET, BOT_TOKEN, BOT_API_ID, BOT_API_HASH, DEMO_MODE,
- DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME) = load_configuration()
+ DEMO_API_ID, DEMO_API_HASH, DEMO_PHONE_NUMBER, DEMO_SESSION_NAME, ENABLE_ADVANCED_BACKTEST_UI) = load_configuration()
 
 # -------------------------
 # Build module-level CONFIG dict for new features (performance/backtester/migration)
@@ -821,54 +824,129 @@ def save_user_performance_settings_exit_rules(user_id: int,
                                               new_rules: List[Dict[str, Any]],
                                               main_module: Any = None) -> None:
     """
-    Save the given list of exit-rule dicts to the user's encrypted file atomically.
+    Persist exit rules into the user's file.
 
-    - user_id: the integer telegram user id
-    - new_rules: a list of normalized exit-rule dicts (as produced by parse_exit_rule_from_text or other UI)
-    - main_module: optional module object (the running main module). If None we attempt a robust dynamic import
-                   of main_bot.py to obtain DATA_DIR and CryptoManager.
+    Preferred path: use persistence_helpers to centralize file handling.
+    Fallback path: attempt to dynamically import main_bot and use its CryptoManager
+                   to decrypt/encrypt the user_{id}.dat file (preserves original behavior).
+
+    This function preserves the original behavior (raises RuntimeError if CryptoManager
+    absent when using the legacy path) and restores debug logging on read/decrypt failures.
     """
-    if main_module is None:
-        # assume this file is inside the same module; import by filename to be robust
-        import importlib.util
-        path = os.path.join(os.path.dirname(__file__), "main_bot.py")
-        spec = importlib.util.spec_from_file_location("main_bot", path)
-        mm = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mm)
-    else:
-        mm = main_module
+    try:
+        import persistence_helpers as ph
+    except Exception:
+        # If import fails, fallback to older behavior (best-effort)
+        # Attempt dynamic import of main_bot to reuse existing CryptoManager and DATA_DIR
+        if main_module is None:
+            import importlib.util
+            path = os.path.join(os.path.dirname(__file__), "main_bot.py")
+            spec = importlib.util.spec_from_file_location("main_bot", path)
+            mm = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mm)
+        else:
+            mm = main_module
 
-    CryptoManager = getattr(mm, "CryptoManager", None)
-    if CryptoManager is None:
-        raise RuntimeError("CryptoManager not found in module when saving exit rules")
+        # Expect CryptoManager to exist in main module (preserve original contract)
+        CryptoManager = getattr(mm, "CryptoManager", None)
+        if CryptoManager is None:
+            raise RuntimeError("CryptoManager not found in module when saving exit rules")
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    user_file = os.path.join(DATA_DIR, f"user_{user_id}.dat")
+        # Use mm.DATA_DIR if present, otherwise fallback to cwd/data
+        DATA_DIR_LOCAL = getattr(mm, "DATA_DIR", os.path.join(os.getcwd(), "data"))
 
-    # read existing
-    user_obj = {}
-    if os.path.exists(user_file):
+        os.makedirs(DATA_DIR_LOCAL, exist_ok=True)
+        user_file = os.path.join(DATA_DIR_LOCAL, f"user_{user_id}.dat")
+
+        # read existing
+        user_obj = {}
+        if os.path.exists(user_file):
+            try:
+                with open(user_file, "rb") as f:
+                    enc = f.read()
+                # Use CryptoManager.decrypt if present (support both class/instance shapes)
+                try:
+                    if hasattr(CryptoManager, "decrypt"):
+                        text = CryptoManager.decrypt(enc)
+                    else:
+                        # CryptoManager may be a callable or different API; try calling
+                        text = CryptoManager(enc)
+                except Exception:
+                    # As a last fallback, try to decode as UTF-8 plaintext
+                    try:
+                        text = enc.decode("utf-8")
+                    except Exception as exc:
+                        # Log and bail to empty user object
+                        logging.debug("Failed to read/decrypt existing user file: %s", exc)
+                        text = None
+
+                if text:
+                    try:
+                        user_obj = json.loads(text)
+                    except Exception as exc:
+                        logging.debug("Failed to parse user file JSON after decrypt/read: %s", exc)
+                        user_obj = {}
+            except Exception as e:
+                logging.debug("Failed to open/read existing user file: %s", e)
+                user_obj = {}
+
+        # Update performance settings and exit rules
+        perf = user_obj.get("performance_settings", {})
+        perf["exit_rules"] = new_rules
+        user_obj["performance_settings"] = perf
+
+        # Prepare plaintext and ciphertext
+        plaintext = json.dumps(user_obj, indent=2)
+
+        # Use CryptoManager.encrypt when available; otherwise raise (we required CryptoManager earlier)
         try:
-            with open(user_file, "rb") as f:
-                enc = f.read()
-            text = CryptoManager.decrypt(enc)
-            user_obj = json.loads(text)
-        except Exception as e:
-            logging.debug("Failed to read/decrypt existing user file: %s", e)
-            user_obj = {}
+            if hasattr(CryptoManager, "encrypt"):
+                ciphertext = CryptoManager.encrypt(plaintext)
+                # ensure bytes
+                if isinstance(ciphertext, str):
+                    data_bytes = ciphertext.encode("utf-8")
+                else:
+                    data_bytes = ciphertext
+            else:
+                # If CryptoManager exists but has no encrypt method, attempt to call it
+                maybe = CryptoManager(plaintext)
+                if isinstance(maybe, str):
+                    data_bytes = maybe.encode("utf-8")
+                elif isinstance(maybe, (bytes, bytearray)):
+                    data_bytes = bytes(maybe)
+                else:
+                    # As a last resort, write plaintext
+                    data_bytes = plaintext.encode("utf-8")
+        except Exception as exc:
+            logging.debug("Failed to encrypt user data while saving exit rules: %s", exc)
+            # Re-raise to avoid persisting sensitive data unencrypted if encryption failed unexpectedly
+            raise
 
+        # atomic write to user_file using tmp then replace
+        fd, tmp_path = tempfile.mkstemp(prefix=f"user_{user_id}_", suffix=".tmp", dir=DATA_DIR_LOCAL)
+        try:
+            with os.fdopen(fd, "wb") as tmpf:
+                tmpf.write(data_bytes)
+            os.replace(tmp_path, user_file)
+        finally:
+            # ensure tmp removed in case of unexpected failure
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        return
+
+    # If persistence_helpers imported successfully, use it (preferred path)
+    # read current user object through helper, update and write back
+    user_obj = ph.read_user_file(user_id)
+    user_obj = ph.migrate_user_file_if_needed(user_obj)
     perf = user_obj.get("performance_settings", {})
     perf["exit_rules"] = new_rules
     user_obj["performance_settings"] = perf
-
-    plaintext = json.dumps(user_obj, indent=2)
-    ciphertext = CryptoManager.encrypt(plaintext)
-
-    # atomic write to user_file using tmp then replace
-    fd, tmp_path = tempfile.mkstemp(prefix=f"user_{user_id}_", suffix=".tmp", dir=DATA_DIR)
-    with os.fdopen(fd, "wb") as tmpf:
-        tmpf.write(ciphertext)
-    os.replace(tmp_path, user_file)
+    ph.write_user_file(user_id, user_obj)
+    return
 
 # Top-level /setexit command handler (standalone)
 # ----------------------------
@@ -6447,6 +6525,22 @@ Please send the **private key** for your trading wallet. This message will be de
 
         elif state == "job_confirmation":
             await self.handle_job_confirmation(event, message)
+            
+        elif state == "performance_menu":
+            await self.handle_performance_menu_choice(event)
+            
+        elif state == "run_backtest_menu":
+            # Routed when user is interacting with the Run Backtest top-level menu
+            # Delegate to handler that expects (event, message)
+            await self.handle_run_backtest_selection(event, message)
+
+        elif state == "run_backtest_pick_saved":
+            # Routed when user has picked a saved backtest from the numbered list
+            await self.handle_run_backtest_pick_saved(event, message)
+        
+        elif state == "awaiting_backtest_save_name":
+            # User is expected to reply with a name for the current backtest draft
+            await self.handle_backtest_save_name(event, message)
 
         elif state == "confirming_delete":
             if message.upper() == "DELETE":
@@ -6949,7 +7043,14 @@ Please send the **private key** for your trading wallet. This message will be de
                 # We need to rebuild the user's job list carefully if multiple deletions happen
                 # without refreshing the list. For now, we assume one deletion at a time.
                 deleted_job = forwarder.jobs.pop(job_index_in_user_list)
-                await self.save_user_data(user_id_to_modify, forwarder)
+                # Persist deletion via single-job delete helper
+                job_id = deleted_job.get("id")
+                if job_id:
+                    # run delete in threadpool via wrapper
+                    await self.persist_forwarding_job({"id": job_id, "owner_id": user_id_to_modify, "__delete__": True})
+                else:
+                    # fallback: write full forwarder if job had no id
+                    await self.save_user_data(user_id_to_modify, forwarder)
 
                 await event.reply(f"✅ **Job #{global_job_num} Deleted Successfully**\n\n"
                                 f"👤 **User:** {job_info['phone']}\n"
@@ -7104,6 +7205,153 @@ Please send the **private key** for your trading wallet. This message will be de
             ]
         #
         await event.reply(menu_text, buttons=buttons)
+
+    async def show_run_backtest_menu(self, event):
+        """
+        Show the 'Run Backtest' top-level menu:
+          - Run saved config
+          - Create new config
+          - Quick run (defaults)
+          - Back
+        Stores state 'run_backtest_menu' so selection handling goes to handle_run_backtest_selection.
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+
+        prompt = "▶️ <b>Run Backtest</b>\nChoose an option:"
+        buttons = [
+            [Button.text("Run saved config")],
+            [Button.text("Create new config")],
+            [Button.text("Quick run (defaults)")],
+            [Button.text("⬅️ Back")]
+        ]
+        session.set_state("run_backtest_menu")
+        await event.reply(prompt, buttons=buttons)
+
+    async def handle_run_backtest_selection(self, event, message):
+        """
+        Process selection from the Run Backtest menu.
+        - 'Run saved config' -> lists saved configs with numeric choices
+        - 'Create new config' -> transitions to builder start state ("builder_step_1" or your builder start)
+        - 'Quick run (defaults)' -> triggers a quick backtest run with default presets
+        This function uses persistence_helpers for listing/saving configs.
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+        txt = message.strip().lower()
+
+        import persistence_helpers as ph
+        from backtester import run_backtest_for_user  # note: run_backtest_for_user is the backtester entrypoint per plan
+
+        # Back
+        if txt in ("back", "⬅️ back", "⬅️"):
+            session.set_state("idle")
+            return await self.send_main_menu(event)
+
+        # Create new config -> start builder flow (adapt to your builder state names)
+        if "create" in txt or "new" in txt:
+            # Start builder; your builder state names may differ; adapt accordingly
+            session.set_state("builder_step_1")
+            await self.show_prompt_for_state(event, "builder_step_1")
+            return
+
+        # Quick run with defaults
+        if "quick" in txt:
+            # Build default config per Implementation Plan quick-default preset
+            default_cfg = {
+                "time_range": {"type": "lookback", "days": 7},
+                "min_market_cap": 1_000_000,
+                "min_confidence": 0.3,
+                "position_sizing": {"mode": "percent_of_portfolio", "value": 5.0},
+                "max_signals": 500
+            }
+            await event.reply("🔁 Starting quick backtest with default preset. I'll post progress here.")
+            # make progress callback that posts back to this chat
+            cb = make_progress_callback_for_telegram(self.bot, user_id)
+            # Call backtester entry point (sync or async depending on backtester implementation)
+            try:
+                loop = asyncio.get_running_loop()
+                # If run_backtest_for_user is sync, run in executor
+                if asyncio.iscoroutinefunction(run_backtest_for_user):
+                    result = await run_backtest_for_user(user_id, default_cfg, progress_callback=cb)
+                else:
+                    result = await loop.run_in_executor(None, run_backtest_for_user, user_id, default_cfg, cb)
+                # append history and persist result path if backtester returns a result_path
+                run_meta = {"name": "quick-default", "metadata": result.get("summary", {})}
+                result_path = result.get("result_path")
+                ph.append_backtest_history(user_id, run_meta, result_path=result_path)
+                await event.reply("✅ Quick backtest finished. Use the History command to view runs.")
+            except Exception as e:
+                await event.reply(f"❌ Quick backtest failed: {e}")
+            return
+
+        # Run saved config -> list configs with numbered buttons
+        if "run" in txt or "saved" in txt:
+            configs = ph.list_user_backtest_configs(user_id)
+            if not configs:
+                await event.reply("You have no saved backtest configs. Choose 'Create new config' to make one.")
+                return
+            # Show a numbered list; store mapping in session.temp_data so selection can be resolved
+            choices = []
+            mapping = {}
+            for i, c in enumerate(configs, start=1):
+                label = f"{i}. {c.get('name')} — {c.get('created_at')}"
+                choices.append([Button.text(label)])
+                mapping[str(i)] = c.get("id")
+            # Add Cancel / Back button
+            choices.append([Button.text("⬅️ Back")])
+            session.temp_data["run_backtest_config_map"] = mapping
+            session.set_state("run_backtest_pick_saved")
+            await event.reply("Select a saved config to run:", buttons=choices)
+            return
+
+        # If we get here, unknown token
+        await event.reply("❓ I didn't understand that. Please choose one of the menu options.", buttons=Button.clear())
+
+    async def handle_run_backtest_pick_saved(self, event, message):
+        """
+        Final selection when the user picks a saved config by number.
+        Expects session.state == 'run_backtest_pick_saved' and session.temp_data['run_backtest_config_map'] present.
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+        sel = message.strip().split()[0]
+        if sel.lower() in ("back", "⬅️", "cancel"):
+            session.set_state("run_backtest_menu")
+            return await self.show_run_backtest_menu(event)
+
+        mapping = session.temp_data.get("run_backtest_config_map", {})
+        cfg_id = mapping.get(sel)
+        if not cfg_id:
+            await event.reply("Invalid selection. Please choose a number from the list.")
+            return
+
+        import persistence_helpers as ph
+        cfg = ph.load_user_backtest_config(user_id, cfg_id)
+        if not cfg:
+            await event.reply("Could not load the selected config (it may have been deleted).")
+            session.set_state("run_backtest_menu")
+            return await self.show_run_backtest_menu(event)
+
+        await event.reply(f"✅ Loaded config: {cfg.get('name')}\nStarting backtest and posting progress here.")
+        cb = make_progress_callback_for_telegram(self.bot, user_id)
+        from backtester import run_backtest_for_user
+        try:
+            loop = asyncio.get_running_loop()
+            if asyncio.iscoroutinefunction(run_backtest_for_user):
+                result = await run_backtest_for_user(user_id, cfg, progress_callback=cb)
+            else:
+                result = await loop.run_in_executor(None, run_backtest_for_user, user_id, cfg, cb)
+            # persist run result
+            run_meta = {"name": cfg.get("name", "saved-run"), "metadata": result.get("summary", {})}
+            ph.append_backtest_history(user_id, run_meta, result_path=result.get("result_path"))
+            await event.reply("✅ Backtest finished. Use the History command to view run details.")
+        except Exception as e:
+            await event.reply(f"❌ Backtest failed: {e}")
+        finally:
+            session.set_state("idle")
+
+
         
     async def show_performance_menu(self, event):
         """
@@ -7115,6 +7363,10 @@ Please send the **private key** for your trading wallet. This message will be de
             [Button.text("▶️ Run Backtest", resize=True), Button.text("🧪 Demo Trading", resize=True)],
             [Button.text("⚙️ Configure Exit Rules", resize=True), Button.text("⬅️ Back", resize=True)]
         ]
+        
+        session = await self.get_user_session(event.sender_id)
+        session.set_state("performance_menu")        
+        
         try:
             await event.reply("📊 Performance & Backtest — choose an action:", buttons=buttons)
         except Exception:
@@ -7154,10 +7406,17 @@ Please send the **private key** for your trading wallet. This message will be de
                 # set the session state to the exit-config flow, if you have it
                 session = await self.get_user_session(event.sender_id)
                 session.set_state("awaiting_exit_rule")  # if your state machine uses this
-                await self.show_prompt_for_state(event, "awaiting_redeem_code")  # example; adapt to your state names
+
+                # Start the interactive inline exit-config flow already implemented elsewhere:
+                # create an interactive draft/session and prompt the user to choose a rule type
+                self.exit_config_sessions[event.sender_id] = {"stage": "choose_type", "draft": {}}
+                await event.reply("Choose rule type:", buttons=self._make_type_buttons())
             except Exception:
                 # fallback instruction
-                await event.reply("To configure an exit rule, use the command:\n`/setexit tp:2` (for 2% TP) or `/setexit sl:10`")
+                await event.reply(
+                    "To configure an exit rule, use the command:\n"
+                    "`/setexit tp:2` (for 2% TP) or `/setexit sl:10`"
+                )
         elif text == "⬅️ Back":
             await self.send_main_menu(event)
         else:
@@ -7864,9 +8123,26 @@ Please send the **private key** for your trading wallet. This message will be de
                 details = await forwarder._get_entity_details(source)
                 source_details.append(details)
 
-            # Update job
+            # Update job in-memory
             forwarder.jobs[job_index]['source_ids'] = [d[0] for d in source_details]
-            await self.save_user_data(user_id, forwarder)
+
+            # ensure ownership and persist the single job (preferred)
+            job = forwarder.jobs[job_index]
+            job.setdefault("owner_id", user_id)
+
+            # Prefer single-job persistence but fall back to full forwarder save if it fails.
+            try:
+                await self.persist_forwarding_job(job)
+            except Exception:
+                # best-effort fallback to original behavior — avoid leaving on-disk state stale
+                try:
+                    await self.save_user_data(user_id, forwarder)
+                except Exception:
+                    # Log but continue; reply and in-memory state are still correct
+                    if hasattr(self, "logger"):
+                        self.logger.exception("Failed to persist job and fallback save_user_data also failed in _modify_job_sources")
+                    else:
+                        print("persist_forwarding_job and fallback save_user_data failed in _modify_job_sources")
 
             source_names = [d[1] for d in source_details]
             await event.reply(f"✅ **Sources Updated**\n\n**New sources:** {', '.join(source_names)}", buttons=Button.clear())
@@ -7878,6 +8154,7 @@ Please send the **private key** for your trading wallet. This message will be de
         except ValueError as e:
             await event.reply(f"❌ Error: {e}\n\nPlease try again with valid chat names, usernames, or IDs:")
 
+
     async def _modify_job_destinations(self, event, message, job_index):
         """
         Accept a comma-separated list of destinations.
@@ -7885,9 +8162,10 @@ Please send the **private key** for your trading wallet. This message will be de
           - Telegram chat ids / usernames (existing behaviour)
           - onchain:<0x...> or onchain:<name>.base  (special onchain destinations)
           - bare 0x... addresses or <name>.base (auto-detected)
+
         Stores:
           - forwarder.jobs[job_index]['destination_ids'] -> list of Telegram chat ids (integers)
-          - forwarder.jobs[job_index]['onchain_destinations'] -> list of onchain dest strings
+          - forwarder.jobs[job_index]['onchain_destinations'] -> list of onchain dest strings (only present if non-empty)
         """
         user_id = event.sender_id
         session = await self.get_user_session(user_id)
@@ -7920,13 +8198,32 @@ Please send the **private key** for your trading wallet. This message will be de
             if onchain_destinations:
                 forwarder.jobs[job_index]['onchain_destinations'] = onchain_destinations
             else:
-                # remove field if none present
+                # remove field if none present (preserve original behavior)
                 forwarder.jobs[job_index].pop('onchain_destinations', None)
 
-            # Persist changes
-            await self.save_user_data(event.sender_id, forwarder)
+            # Persist changes: prefer single-job persistence but fall back to full forwarder save
+            job = forwarder.jobs[job_index]
+            job.setdefault("owner_id", user_id)
+            try:
+                await self.persist_forwarding_job(job)
+            except Exception:
+                # Fallback to original behavior: save full forwarder to avoid on-disk/in-memory divergence
+                try:
+                    await self.save_user_data(event.sender_id, forwarder)
+                except Exception:
+                    if hasattr(self, "logger"):
+                        self.logger.exception("Failed to persist job and fallback save_user_data also failed in _modify_job_destinations")
+                    else:
+                        print("persist_forwarding_job and fallback save_user_data failed in _modify_job_destinations")
 
+            # Reply (preserve original text)
             await event.reply("✅ Destinations updated.")
+
+            # Preserve original session flow: do NOT change session state here (old function didn't)
+            # (If you want to switch to job_management flow, do so intentionally elsewhere.)
+
+            return
+
         except Exception as e:
             logging.exception(f"Error modifying job destinations: {e}")
             await event.reply(f"❌ Invalid selection: {e}")
@@ -7939,18 +8236,24 @@ Please send the **private key** for your trading wallet. This message will be de
         session = await self.get_user_session(user_id)
         forwarder = self.user_forwarders[user_id]
 
+        # Preserve original semantic: 'none' -> empty list (forward all messages)
         keywords = []
         if message.lower() != 'none':
             keywords = [k.strip() for k in message.split(',') if k.strip()]
 
-        # Update job
+        # Update job in-memory
         forwarder.jobs[job_index]['keywords'] = keywords
+
         # ADDED: Reset match logic if only one keyword now
         if len(keywords) <= 1:
             forwarder.jobs[job_index]['match_logic'] = 'OR'
 
-        await self.save_user_data(user_id, forwarder)
+        # persist single job (async-safe wrapper)
+        job = forwarder.jobs[job_index]
+        job.setdefault("owner_id", user_id)
+        await self.persist_forwarding_job(job)
 
+        # reply: preserve original conditional responses
         if keywords:
             await event.reply(f"✅ **Keywords Updated**\n\n**New keywords:** {', '.join(keywords)}", buttons=Button.clear())
         else:
@@ -7969,9 +8272,23 @@ Please send the **private key** for your trading wallet. This message will be de
         if message.lower() != 'none':
             cashtags = [c.strip() for c in message.split(',') if c.strip()]
 
-        # Update job
+        # Update job in-memory
         forwarder.jobs[job_index]['cashtags'] = cashtags
-        await self.save_user_data(user_id, forwarder)
+
+        # persist single job (preferred) with fallback to full forwarder save
+        job = forwarder.jobs[job_index]
+        job.setdefault("owner_id", user_id)
+        try:
+            await self.persist_forwarding_job(job)
+        except Exception:
+            # fallback to original behavior to avoid on-disk/in-memory divergence
+            try:
+                await self.save_user_data(user_id, forwarder)
+            except Exception:
+                if hasattr(self, "logger"):
+                    self.logger.exception("persist_forwarding_job failed and fallback save_user_data also failed in _modify_job_cashtags")
+                else:
+                    print("persist_forwarding_job and fallback save_user_data failed in _modify_job_cashtags")
 
         if cashtags:
             await event.reply(f"✅ **Cashtags Updated**\n\n**New cashtags:** {', '.join(cashtags)}", buttons=Button.clear())
@@ -7995,13 +8312,26 @@ Please send the **private key** for your trading wallet. This message will be de
                 await event.reply(f"❌ **Invalid Pattern:** One of your patterns is not valid.\n`{e}`\nPlease try again:")
                 return
 
-        # Update job
+        # Update job in-memory
         forwarder.jobs[job_index]['patterns'] = patterns
         # ADDED: Reset match logic if only one pattern now
         if len(patterns) <= 1:
             forwarder.jobs[job_index]['match_logic'] = 'OR'
 
-        await self.save_user_data(user_id, forwarder)
+        # persist single job (preferred) with fallback to full forwarder save
+        job = forwarder.jobs[job_index]
+        job.setdefault("owner_id", user_id)
+        try:
+            await self.persist_forwarding_job(job)
+        except Exception:
+            # fallback to original behavior to avoid on-disk/in-memory divergence
+            try:
+                await self.save_user_data(user_id, forwarder)
+            except Exception:
+                if hasattr(self, "logger"):
+                    self.logger.exception("persist_forwarding_job failed and fallback save_user_data also failed in _modify_job_patterns")
+                else:
+                    print("persist_forwarding_job and fallback save_user_data failed in _modify_job_patterns")
 
         await event.reply(f"✅ **Patterns Updated**\n\n**New patterns:** `{', '.join(patterns)}`", buttons=Button.clear())
 
@@ -8019,7 +8349,21 @@ Please send the **private key** for your trading wallet. This message will be de
             logic = 'AND'
 
         forwarder.jobs[job_index]['match_logic'] = logic
-        await self.save_user_data(user_id, forwarder)
+
+        # persist single job (preferred) with fallback to full forwarder save
+        job = forwarder.jobs[job_index]
+        job.setdefault("owner_id", user_id)
+        try:
+            await self.persist_forwarding_job(job)
+        except Exception:
+            # fallback: ensure forwarder persisted to avoid on-disk/in-memory divergence
+            try:
+                await self.save_user_data(user_id, forwarder)
+            except Exception:
+                if hasattr(self, "logger"):
+                    self.logger.exception("persist_forwarding_job failed and fallback save_user_data also failed in _modify_job_match_logic")
+                else:
+                    print("persist_forwarding_job and fallback save_user_data failed in _modify_job_match_logic")
 
         await event.reply(f"✅ **Match Logic Updated** to `{logic}`.", buttons=Button.clear())
 
@@ -8027,7 +8371,6 @@ Please send the **private key** for your trading wallet. This message will be de
         session.set_state("job_management")
         session.modifying_job_index = None
         await self.show_job_management(event)
-
 
     async def _modify_job_timer(self, event, message, job_index):
         user_id = event.sender_id
@@ -8040,7 +8383,21 @@ Please send the **private key** for your trading wallet. This message will be de
 
         # Update job
         forwarder.jobs[job_index]['timer'] = timer
-        await self.save_user_data(user_id, forwarder)
+
+        # persist single job (preferred) with fallback to full forwarder save
+        job = forwarder.jobs[job_index]
+        job.setdefault("owner_id", user_id)
+        try:
+            await self.persist_forwarding_job(job)
+        except Exception:
+            # fallback to original behavior to avoid on-disk/in-memory divergence
+            try:
+                await self.save_user_data(user_id, forwarder)
+            except Exception:
+                if hasattr(self, "logger"):
+                    self.logger.exception("persist_forwarding_job failed and fallback save_user_data also failed in _modify_job_timer")
+                else:
+                    print("persist_forwarding_job and fallback save_user_data failed in _modify_job_timer")
 
         if timer:
             await event.reply(f"✅ **Timer Updated**\n\n**New cooldown:** {timer}", buttons=Button.clear())
@@ -8083,6 +8440,241 @@ Send the number (1-5) or type the job type name.""")
         buttons = [[Button.text("🔙 Back to Main Menu", resize=True)]]
 
         await event.reply(prompt, buttons=buttons)
+        
+    async def show_run_backtest_menu(self, event):
+        """
+        Show the 'Run Backtest' top-level menu:
+          - Run saved config
+          - Create new config
+          - Quick run (defaults)
+          - Back
+        Stores state 'run_backtest_menu' so selection handling goes to handle_run_backtest_selection.
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+
+        prompt = "▶️ <b>Run Backtest</b>\nChoose an option:"
+        buttons = [
+            [Button.text("Run saved config")],
+            [Button.text("Create new config")],
+            [Button.text("Quick run (defaults)")],
+            [Button.text("⬅️ Back")]
+        ]
+        session.set_state("run_backtest_menu")
+        await event.reply(prompt, buttons=buttons)
+
+
+    async def handle_run_backtest_selection(self, event, message):
+        """
+        Process selection from the Run Backtest menu.
+        - 'Run saved config' -> lists saved configs with numeric choices
+        - 'Create new config' -> transitions to builder start state ("builder_step_1")
+        - 'Quick run (defaults)' -> triggers a quick backtest run with default presets
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+        txt = (message or getattr(event, "raw_text", "") or "").strip().lower()
+
+        import persistence_helpers as ph
+        from backtester import run_backtest_for_user  # adapt name if different
+
+        # Back
+        if txt in ("back", "⬅️ back", "⬅️"):
+            session.set_state("idle")
+            await self.send_main_menu(event)
+            return
+
+        # Create new config -> start builder flow
+        if "create" in txt or "new" in txt:
+            session.set_state("builder_step_1")
+            await self.show_prompt_for_state(event, "builder_step_1")
+            return
+
+        # Quick run with defaults
+        if "quick" in txt:
+            default_cfg = {
+                "time_range": {"type": "lookback", "days": 7},
+                "min_market_cap": 1_000_000,
+                "min_confidence": 0.3,
+                "position_sizing": {"mode": "percent_of_portfolio", "value": 5.0},
+                "max_signals": 500
+            }
+            await event.reply("🔁 Starting quick backtest with default preset. I'll post progress here.")
+            cb = make_progress_callback_for_telegram(self.bot, user_id)
+            try:
+                loop = __import__("asyncio").get_running_loop()
+                if __import__("asyncio").iscoroutinefunction(run_backtest_for_user):
+                    result = await run_backtest_for_user(user_id, default_cfg, progress_callback=cb)
+                else:
+                    result = await loop.run_in_executor(None, run_backtest_for_user, user_id, default_cfg, cb)
+                run_meta = {"name": "quick-default", "metadata": result.get("summary", {})}
+                result_path = result.get("result_path")
+                ph.append_backtest_history(user_id, run_meta, result_path=result_path)
+                await event.reply("✅ Quick backtest finished. Use the History command to view runs.")
+            except Exception as e:
+                await event.reply(f"❌ Quick backtest failed: {e}")
+            return
+
+        # Run saved config -> list configs with numbered buttons
+        if "run" in txt or "saved" in txt:
+            configs = ph.list_user_backtest_configs(user_id)
+            if not configs:
+                await event.reply("You have no saved backtest configs. Choose 'Create new config' to make one.")
+                return
+            choices = []
+            mapping = {}
+            for i, c in enumerate(configs, start=1):
+                label = f"{i}. {c.get('name', 'unnamed')} — {c.get('created_at', 'unknown')}"
+                choices.append([Button.text(label)])
+                mapping[str(i)] = c.get("id")
+            choices.append([Button.text("⬅️ Back")])
+            session.temp_data["run_backtest_config_map"] = mapping
+            session.set_state("run_backtest_pick_saved")
+            await event.reply("Select a saved config to run:", buttons=choices)
+            return
+
+        await event.reply("❓ I didn't understand that. Please choose one of the menu options.", buttons=Button.clear())
+
+
+    async def handle_run_backtest_pick_saved(self, event, message):
+        """
+        Final selection when the user picks a saved config by number.
+        Expects session.state == 'run_backtest_pick_saved' and session.temp_data['run_backtest_config_map'] present.
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+        sel = (message or getattr(event, "raw_text", "") or "").strip().split()[0]
+        if sel.lower() in ("back", "⬅️", "cancel"):
+            session.set_state("run_backtest_menu")
+            await self.show_run_backtest_menu(event)
+            return
+
+        mapping = session.temp_data.get("run_backtest_config_map", {})
+        cfg_id = mapping.get(sel)
+        if not cfg_id:
+            await event.reply("Invalid selection. Please choose a number from the list.")
+            return
+
+        import persistence_helpers as ph
+        from backtester import run_backtest_for_user
+        cfg = ph.load_user_backtest_config(user_id, cfg_id)
+        if not cfg:
+            await event.reply("Could not load the selected config (it may have been deleted).")
+            session.set_state("run_backtest_menu")
+            await self.show_run_backtest_menu(event)
+            return
+
+        await event.reply(f"✅ Loaded config: {cfg.get('name')}\nStarting backtest and posting progress here.")
+        cb = make_progress_callback_for_telegram(self.bot, user_id)
+        try:
+            loop = __import__("asyncio").get_running_loop()
+            if __import__("asyncio").iscoroutinefunction(run_backtest_for_user):
+                result = await run_backtest_for_user(user_id, cfg, progress_callback=cb)
+            else:
+                result = await loop.run_in_executor(None, run_backtest_for_user, user_id, cfg, cb)
+            run_meta = {"name": cfg.get("name", "saved-run"), "metadata": result.get("summary", {})}
+            ph.append_backtest_history(user_id, run_meta, result_path=result.get("result_path"))
+            await event.reply("✅ Backtest finished. Use the History command to view run details.")
+        except Exception as e:
+            await event.reply(f"❌ Backtest failed: {e}")
+        finally:
+            session.set_state("idle")
+
+    async def save_backtest_draft_as_named_config(self, user_id: int, draft: dict, name: str) -> str:
+        """
+        Persist a backtest draft as a named saved config for the given user.
+
+        - user_id: numeric id
+        - draft: dictionary with fields built during the builder flow (may be incomplete; this function
+                 fills sensible defaults required by the backtester/persistence)
+        - name: user-provided name for the saved config
+
+        Returns:
+          - config_id (string) returned from persistence_helpers.save_user_backtest_config
+        """
+        # Defensive normalization of the draft into a saved backtest config
+        # Keep this lightweight and safe for user-provided drafts.
+        try:
+            import persistence_helpers as ph
+        except Exception as exc:
+            # If persistence layer not importable, raise for caller to handle
+            raise RuntimeError(f"persistence helpers not available: {exc}")
+
+        # Ensure draft is a dict
+        d = draft or {}
+        cfg = {}
+
+        # Basic metadata
+        cfg["name"] = name or d.get("name") or f"backtest_{__import__('datetime').datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        cfg["owner_user_id"] = int(user_id)
+        cfg["created_at"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+
+        # Copy most fields from draft while applying defaults
+        cfg["source_chat_ids"] = d.get("source_chat_ids") or d.get("source_chats") or []
+        cfg["time_range"] = d.get("time_range") or {"type": "lookback", "days": 7}
+        cfg["keywords"] = d.get("keywords") or []
+        cfg["cashtags"] = d.get("cashtags") or []
+        cfg["custom_patterns"] = d.get("custom_patterns") or []
+        # market filters / validation
+        cfg["min_market_cap"] = float(d.get("min_market_cap", d.get("min_cap", 0)))
+        cfg["min_confidence"] = float(d.get("min_confidence", d.get("min_conf", 0.0)))
+        cfg["max_signals"] = int(d.get("max_signals", 500))
+        # position sizing (nested)
+        cfg["position_sizing"] = d.get("position_sizing") or {"mode": "percent_of_portfolio", "value": 5.0}
+        # exit rules (pass-through if present)
+        cfg["exit_rules"] = d.get("exit_rules") or d.get("exit_rule_ids") or []
+
+        # Additional optional fields helpful for reproducibility
+        cfg["fees_percent"] = float(d.get("fees_percent", d.get("fees", {}).get("fee_pct", 0.4) if isinstance(d.get("fees"), dict) else d.get("fees_percent", 0.4)))
+        cfg["slippage_percent"] = float(d.get("slippage_percent", d.get("fees", {}).get("slippage_pct", 0.0) if isinstance(d.get("fees"), dict) else d.get("slippage_percent", 0.0)))
+
+        # Attach the raw draft for future debugging/backwards compatibility
+        cfg["_draft_snapshot"] = d
+
+        # Persist via persistence_helpers
+        try:
+            cfg_id = ph.save_user_backtest_config(user_id, cfg)
+        except Exception as exc:
+            # Re-raise or wrap for UI handler to catch and report
+            raise RuntimeError(f"Failed to save backtest config: {exc}")
+
+        return cfg_id
+
+    async def handle_backtest_save_name(self, event, message):
+        """
+        Handler for the builder UI step where the user provides a name for the current
+        backtest draft. Assumes the session holds the draft at session.temp_data['incomplete_backtest_draft']
+        (or similar key used by builder flow). Saves the draft via save_backtest_draft_as_named_config
+        and reports back the saved config id.
+        """
+        user_id = event.sender_id
+        session = await self.get_user_session(user_id)
+        name = (message or getattr(event, "raw_text", "") or "").strip()
+        if not name:
+            await event.reply("Please send a non-empty name for this backtest configuration (e.g., `Top 10 tokens last 7d`).")
+            return
+
+        draft = session.temp_data.get("incomplete_backtest_draft") or session.temp_data.get("draft") or {}
+        if not draft:
+            # If no draft is present, abort and inform the user
+            await event.reply("No draft found to save. Please build a backtest configuration first.")
+            session.set_state("idle")
+            return
+
+        try:
+            cfg_id = await self.save_backtest_draft_as_named_config(user_id, draft, name)
+        except Exception as exc:
+            await event.reply(f"❌ Failed to save config: {exc}")
+            session.set_state("idle")
+            return
+
+        # Clear draft and session state (optionally keep draft)
+        session.temp_data.pop("incomplete_backtest_draft", None)
+        session.temp_data.pop("draft", None)
+        session.set_state("idle")
+
+        await event.reply(f"✅ Saved backtest config \"{name}\" (id: `{cfg_id}`).\nYou can run it from the Run Backtest → Run saved config menu.")
+
 
     # This handler processes the job type (e.g., "1" for Keywords)
     async def handle_job_creation(self, event, message):
@@ -8684,7 +9276,19 @@ Please choose one:"""
             await event.reply("Please choose 'Yes' or 'No'.")
 
     async def handle_pattern_save_name(self, event, message):
-        """Handles getting the name for a new pattern and saving it."""
+        """Handles getting the name for a new pattern and saving it.
+
+        Split behavior:
+          1) Save the named pattern into the user's permanent pattern library
+             (keeps this as a full-user save because it's user-scoped data).
+          2) If the pattern was also attached to an *existing* job (session.pending_job
+             contains an 'id' that matches a job in forwarder.jobs), persist that single
+             job using persistence_helpers.save_forwarding_job (executor) with a fallback
+             to self.persist_forwarding_job(job).
+          3) If session.pending_job is only an unsaved pending job (no id), we attach the
+             pattern in memory and do not persist the job here (it will be persisted when
+             the job is finalized).
+        """
         user_id = event.sender_id
         session = await self.get_user_session(user_id)
         forwarder = self.user_forwarders[user_id]
@@ -8696,21 +9300,85 @@ Please choose one:"""
             'pattern': pattern_to_add
         }
 
-        # Save to the user's permanent list
-        forwarder.saved_patterns.append(new_pattern)
-        await self.save_user_data(user_id, forwarder) # Save immediately
+        # Ensure forwarder.saved_patterns exists
+        try:
+            if not hasattr(forwarder, 'saved_patterns') or forwarder.saved_patterns is None:
+                forwarder.saved_patterns = []
+        except Exception:
+            # If forwarder is a dict-like object
+            forwarder.setdefault('saved_patterns', [])
 
-        # Also add it to the current job
+        # 1) Save to the user's permanent list (full-user save)
+        forwarder.saved_patterns.append(new_pattern)
+        # Keep the original full-user save for the library (pattern library is user-level)
+        await self.save_user_data(user_id, forwarder)
+
+        # 2) Also add it to the current job in the session
         if 'patterns' not in session.pending_job:
             session.pending_job['patterns'] = []
         session.pending_job['patterns'].append(pattern_to_add)
         session.temp_data.pop('current_pattern', None)
 
+        # Persist the job only if this session.pending_job corresponds to an existing job
+        # that lives in forwarder.jobs (identified by 'id').
+        job_id = session.pending_job.get('id')
+        if job_id:
+            # try to find the job in the forwarder.jobs list
+            try:
+                target_job = None
+                for j in getattr(forwarder, "jobs", []) or forwarder.get("jobs", [] if isinstance(forwarder, dict) else []):
+                    if j.get("id") == job_id:
+                        target_job = j
+                        break
+            except Exception:
+                # defensive fallback: if forwarder is an object with attribute jobs
+                try:
+                    for j in forwarder.jobs:
+                        if j.get("id") == job_id:
+                            target_job = j
+                            break
+                except Exception:
+                    target_job = None
+
+            if target_job is not None:
+                # Ensure patterns field exists on the stored job and is in sync
+                try:
+                    target_job.setdefault("patterns", [])
+                    # Avoid duplicate appends if already present
+                    if pattern_to_add not in target_job["patterns"]:
+                        target_job["patterns"].append(pattern_to_add)
+                except Exception:
+                    # best-effort: ensure we don't crash
+                    try:
+                        target_job["patterns"] = target_job.get("patterns", []) + [pattern_to_add]
+                    except Exception:
+                        pass
+
+                # Persist single job using persistence_helpers in a threadpool, fallback to wrapper
+                try:
+                    import persistence_helpers as ph, asyncio
+                    loop = asyncio.get_running_loop()
+                    # Coerce user_id to int when possible
+                    try:
+                        uid_int = int(user_id)
+                    except Exception:
+                        uid_int = user_id
+                    await loop.run_in_executor(None, lambda: ph.save_forwarding_job(uid_int, target_job))
+                except Exception:
+                    # fallback to wrapper which is async-safe
+                    try:
+                        await self.persist_forwarding_job(target_job)
+                    except Exception:
+                        if hasattr(self, "logger"):
+                            self.logger.exception("Failed to persist job after adding named pattern")
+
+        # Reply & continue flow
         await event.reply(f"✅ Pattern saved as **'{pattern_name}'**.")
 
         # Transition to the multi-pattern check
         session.set_state("job_pattern_add_or_done")
-        await self.handle_pattern_add_or_done(event, "") # Call the next step
+        await self.handle_pattern_add_or_done(event, "")
+
 
     async def handle_pattern_add_or_done(self, event, message):
         """Asks the user if they want to add another pattern or finish."""
@@ -8875,7 +9543,25 @@ Here are some ready-to-use descriptions you can copy for the `[Describe the text
             if 1 <= job_num <= len(all_jobs):
                 # The index in the actual forwarder.jobs list is job_num - 1
                 deleted_job = forwarder.jobs.pop(job_num - 1)
-                await self.save_user_data(user_id, forwarder)
+                
+                # Persist deletion via single-job delete helper
+                job_id = deleted_job.get('id')
+                if job_id:                    
+                    # prefer direct persistence_helpers delete in executor
+                    try:
+                        import persistence_helpers as ph, asyncio
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, lambda: ph.delete_forwarding_job(int(user_id), job_id))
+                    except Exception:
+                        # fallback via wrapper sentinel                    
+                        try:
+                            await self.persist_forwarding_job({"id": job_id, "owner_id": user_id, "__delete__": True})
+                        except Exception:
+                            if hasattr(self, "logger"):
+                                self.logger.exception("Failed to delete job via persistence helpers")
+                else:
+                    await self.save_user_data(user_id, forwarder)
+                
                 job_type = deleted_job.get('type', 'Unknown').replace('_', ' ').capitalize()
                 await event.reply(f"✅ Job #{job_num} deleted successfully!\n\n**{job_type}** job has been removed.", buttons=Button.clear())
                 session.set_state("idle")
@@ -9271,8 +9957,162 @@ If something fails
 
         except Exception as e:
             logging.error(f"Failed to remove user data for {user_id}: {e}")
+            
+    async def persist_forwarding_job(self, job: dict) -> bool:
+        """
+        Async-safe wrapper to persist a single forwarding job.
 
-    # REPLACED
+        Behavior:
+          - If job contains "__delete__": True and "id": <job_id>, will attempt to delete via persistence_helpers.delete_forwarding_job.
+          - Otherwise will call persistence_helpers.save_forwarding_job(user_id, job) in a threadpool.
+          - Falls back to:
+              * a bot-level save_forwarding_job / delete_forwarding_job if provided,
+              * a full forwarder save via save_user_data (best-effort),
+              * and finally an in-memory jobs_store.
+        Returns:
+          - True on success (delete or save succeeded)
+          - False on failure
+        """
+        import asyncio
+        import traceback
+        import uuid
+
+        try:
+            # basic validation
+            if not isinstance(job, dict):
+                if hasattr(self, "logger"):
+                    self.logger.warning("persist_forwarding_job called with non-dict job")
+                return False
+
+            is_delete = bool(job.get("__delete__", False))
+            job_id = job.get("id")
+            uid = job.get("owner_id") or job.get("user_id") or getattr(self, "current_user_id", None)
+
+            # try to coerce uid to int when possible
+            try:
+                if uid is not None:
+                    uid = int(uid)
+            except Exception:
+                # some flows may keep string ids; continue with original value
+                pass
+
+            # ---------------- Primary: persistence_helpers in threadpool ----------------
+            try:
+                import persistence_helpers as ph
+                loop = asyncio.get_running_loop()
+                if is_delete:
+                    if not job_id:
+                        if hasattr(self, "logger"):
+                            self.logger.warning("persist_forwarding_job: delete requested but no job id provided")
+                        return False
+                    result = await loop.run_in_executor(None, lambda: ph.delete_forwarding_job(uid, job_id))
+                    return bool(result)
+                else:
+                    # Ensure owner_id is set for new/updated jobs
+                    if uid is not None:
+                        job.setdefault("owner_id", uid)
+                    # ph.save_forwarding_job may return the saved id or True
+                    result = await loop.run_in_executor(None, lambda: ph.save_forwarding_job(uid, job))
+                    return bool(result)
+            except Exception as e_ph:
+                if hasattr(self, "logger"):
+                    self.logger.debug(f"persist_forwarding_job: persistence_helpers path failed: {e_ph}")
+                # fall through to fallback strategies
+
+            # ---------------- Fallback 1: bot-level save/delete handlers ----------------
+            try:
+                if hasattr(self, "save_forwarding_job") or hasattr(self, "delete_forwarding_job"):
+                    # delete flow
+                    if is_delete:
+                        if hasattr(self, "delete_forwarding_job"):
+                            delete_fn = getattr(self, "delete_forwarding_job")
+                            if asyncio.iscoroutinefunction(delete_fn):
+                                await delete_fn(uid, job_id)
+                            else:
+                                loop = asyncio.get_running_loop()
+                                await loop.run_in_executor(None, lambda: delete_fn(uid, job_id))
+                            return True
+                    else:
+                        if hasattr(self, "save_forwarding_job"):
+                            fn = getattr(self, "save_forwarding_job")
+                            if asyncio.iscoroutinefunction(fn):
+                                res = await fn(uid, job)
+                            else:
+                                loop = asyncio.get_running_loop()
+                                res = await loop.run_in_executor(None, lambda: fn(uid, job))
+                            return bool(res)
+            except Exception as e_fn:
+                if hasattr(self, "logger"):
+                    self.logger.debug(f"persist_forwarding_job: fallback save_forwarding_job/delete_forwarding_job failed: {e_fn}")
+
+            # ---------------- Fallback 2: full-user save (best-effort) ----------------
+            try:
+                if hasattr(self, "user_forwarders") and uid in getattr(self, "user_forwarders"):
+                    forwarder = self.user_forwarders[uid]
+
+                    if is_delete and job_id:
+                        # remove job by id from forwarder.jobs
+                        try:
+                            forwarder.jobs = [j for j in forwarder.jobs if j.get("id") != job_id]
+                        except Exception:
+                            pass
+                    else:
+                        # replace existing job if id matches, else append
+                        replaced = False
+                        for i, j in enumerate(forwarder.jobs):
+                            if j.get("id") is not None and j.get("id") == job.get("id"):
+                                forwarder.jobs[i] = job
+                                replaced = True
+                                break
+                        if not replaced:
+                            forwarder.jobs.append(job)
+
+                    # persist the full forwarder if save_user_data is available
+                    if hasattr(self, "save_user_data"):
+                        # support both coroutine and sync variants
+                        if asyncio.iscoroutinefunction(self.save_user_data):
+                            await self.save_user_data(uid, forwarder)
+                        else:
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(None, lambda: self.save_user_data(uid, forwarder))
+                        return True
+            except Exception as e_fwd:
+                if hasattr(self, "logger"):
+                    self.logger.debug(f"persist_forwarding_job: fallback full-forwarder save failed: {e_fwd}")
+
+            # ---------------- Fallback 3: in-memory store ----------------
+            try:
+                if hasattr(self, "jobs_store") and isinstance(self.jobs_store, dict):
+                    if is_delete and job_id:
+                        self.jobs_store.pop(job_id, None)
+                        return True
+                    else:
+                        jid = job_id or job.get("job_id") or str(uuid.uuid4())
+                        job["id"] = jid
+                        self.jobs_store[jid] = job
+                        return True
+            except Exception as e_store:
+                if hasattr(self, "logger"):
+                    self.logger.debug(f"persist_forwarding_job: fallback jobs_store failed: {e_store}")
+
+            # final: unable to persist
+            if hasattr(self, "logger"):
+                self.logger.warning("persist_forwarding_job: unable to persist job; ensure persistence_helpers.save_forwarding_job exists.")
+            else:
+                print("persist_forwarding_job: unable to persist job; ensure persistence_helpers.save_forwarding_job exists.")
+            return False
+
+        except Exception as exc:
+            # catch-all with stacktrace
+            try:
+                if hasattr(self, "logger"):
+                    self.logger.exception(f"persist_forwarding_job failed: {exc}\n{traceback.format_exc()}")
+                else:
+                    print("persist_forwarding_job exception:", exc)
+            except Exception:
+                pass
+            return False
+
     async def restore_user_sessions(self):
         """Restore user sessions on bot startup with enhanced error tracking"""
         print("🔄 Restoring user sessions...")
@@ -9396,47 +10236,77 @@ If something fails
             await event.reply("Please respond with 'proceed', 'fix', or 'cancel'.")
 
     async def finalize_job_creation(self, event, session, forwarder):
-        """Finalize job creation with comprehensive summary"""
-        forwarder.jobs.append(session.pending_job.copy())
-        await self.save_user_data(event.sender_id, forwarder)
+        """Finalize job creation with comprehensive summary.
 
-        job = session.pending_job
-        job_type = job['type'].replace('_', ' ').capitalize()
-        source_names = [forwarder.chat_cache.get(sid, f"ID {sid}") for sid in job['source_ids']]
-        dest_names = [forwarder.chat_cache.get(did, f"ID {did}") for did in job['destination_ids']]
+        Preserves original UI summary, tip, idle state, and menu flow.
+        Adds single-job persistence and ensures owner_id is set on the job.
+        """
+        # Create a copy of the pending job (keeps original semantics)
+        job = session.pending_job.copy()
+        job.setdefault("owner_id", event.sender_id)
 
-        # ADDED: Display AND/OR logic in summary
+        # Append to in-memory forwarder jobs list
+        forwarder.jobs.append(job)
+
+        # Persist the single job (async-safe wrapper). Best-effort - don't crash UI if persistence fails.
+        # persist newly created job (use ph.save_forwarding_job in executor, fallback to wrapper)
+        try:
+            import persistence_helpers as ph, asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: ph.save_forwarding_job(int(event.sender_id), new_job))
+        except Exception:
+            # fallback to existing wrapper (already async-safe)
+            try:
+                await self.persist_forwarding_job(job)
+            except Exception:
+                # Log but continue to avoid blocking UX
+                if hasattr(self, "logger"):
+                    self.logger.exception("persist_forwarding_job failed during finalize_job_creation")
+                else:
+                    print("persist_forwarding_job failed during finalize_job_creation")
+
+        # Build summary using the same logic/format as the original function
+        job_type = job.get('type', 'unknown').replace('_', ' ').capitalize()
+        # Determine match logic display for keywords / patterns
         match_logic = job.get('match_logic', 'OR')
         job_type_str = job_type
-        items_key = 'keywords' if job['type'] == 'keywords' else 'patterns'
-        if job['type'] in ['keywords', 'custom_pattern'] and len(job.get(items_key, [])) > 1:
+        items_key = 'keywords' if job.get('type') == 'keywords' else 'patterns'
+        if job.get('type') in ['keywords', 'custom_pattern'] and len(job.get(items_key, [])) > 1:
             job_type_str += f" ({match_logic})"
 
+        source_names = [forwarder.chat_cache.get(sid, f"ID {sid}") for sid in job.get('source_ids', [])]
+        dest_names = [forwarder.chat_cache.get(did, f"ID {did}") for did in job.get('destination_ids', [])]
 
         summary = "✅ **Job Created Successfully!**\n\n"
         summary += f"📝 Job Name: {job.get('job_name', 'Default')}\n"
         summary += f"📋 Type: {job_type_str}\n"
-        summary += f"📥 **Sources:** {', '.join(source_names)}\n"
-        summary += f"📤 **Destinations:** {', '.join(dest_names)}\n"
+        summary += f"📥 **Sources:** {', '.join(source_names) if source_names else '—'}\n"
+        summary += f"📤 **Destinations:** {', '.join(dest_names) if dest_names else '—'}\n"
 
-        if job['type'] == 'keywords' and job.get('keywords'):
-            summary += f"🔤 **Keywords:** {', '.join(job['keywords'])}\n"
-        elif job['type'] == 'cashtags' and job.get('cashtags'):
-            summary += f"💰 **Cashtags:** {', '.join(job['cashtags'])}\n"
-        elif job['type'] == 'custom_pattern' and job.get('patterns'):
-            summary += f"🔍 **Patterns:** `{', '.join(job['patterns'])}`\n"
+        if job.get('type') == 'keywords' and job.get('keywords'):
+            summary += f"🔤 **Keywords:** {', '.join(job.get('keywords', []))}\n"
+        elif job.get('type') == 'cashtags' and job.get('cashtags'):
+            summary += f"💰 **Cashtags:** {', '.join(job.get('cashtags', []))}\n"
+        elif job.get('type') == 'custom_pattern' and job.get('patterns'):
+            # keep backtick quoting for patterns as in old function
+            summary += f"🔍 **Patterns:** `{', '.join(job.get('patterns', []))}`\n"
 
         if job.get('timer'):
-            summary += f"⏱️ **Cooldown:** {job['timer']}\n"
+            summary += f"⏱️ **Cooldown:** {job.get('timer')}\n"
 
         summary += "\n🚀 The job is now active and monitoring messages!"
         summary += "\n\n💡 **Tip:** You'll be notified if any destinations become inaccessible."
 
+        # Restore the original session state (idle) and cleanup pending job (same as old)
         session.set_state("idle")
         session.pending_job = {}
         session.temp_data = {}
+
         await event.reply(summary, buttons=Button.clear())
+        # Original flow returned to main menu
         await self.send_main_menu(event)
+
+
         
     async def handle_awaiting_base_private_key(self, event, message):
         """Processes and securely stores the user's Base wallet private key."""
@@ -9697,8 +10567,9 @@ async def execute_onchainkit_swap(user_id: int, token_to_buy_address: str, eth_a
             'chainId': 8453
         }
         main_tx['gas'] = w3.eth.estimate_gas(main_tx)
-        
+        # Sign
         signed_tx = w3.eth.account.sign_transaction(main_tx, private_key)
+        # Send
         tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
         
         # Don't wait for receipt in this function, just return hash
@@ -10194,11 +11065,14 @@ def register_bot_payment_handlers(bot_instance):
             job = fwd.jobs[job_index]
             job['onchain_transfer'] = True
             job['onchain_amount'] = float(amount)
-            # persist via bot_instance if available
+
+            # persist via bot_instance if available            
+            job.setdefault("owner_id", user_id)
             try:
-                await bot_instance.save_user_data(user_id, fwd)
+                await bot_instance.persist_forwarding_job(job)
             except Exception:
                 pass
+                
             await event.reply(f"✅ Onchain transfer enabled for job {job_index} amount={amount}")
         except Exception as e:
             await event.reply(f"Error enabling onchain transfer: {e}")
@@ -10340,10 +11214,13 @@ def register_bot_payment_handlers(bot_instance):
             job = fwd.jobs[job_index]
             job.pop('onchain_transfer', None)
             job.pop('onchain_amount', None)
+            
+            job.setdefault("owner_id", user_id)
             try:
-                await bot_instance.save_user_data(user_id, fwd)
+                await bot_instance.persist_forwarding_job(job)
             except Exception:
                 pass
+                
             await event.reply(f"✅ Onchain transfer disabled for job {job_index}")
         except Exception as e:
             await event.reply(f"Error disabling onchain transfer: {e}")
@@ -10360,10 +11237,13 @@ def register_bot_payment_handlers(bot_instance):
                 return
             job = fwd.jobs[job_index]
             job['onchain_amount'] = float(amount)
+            
+            job.setdefault("owner_id", user_id)
             try:
-                await bot_instance.save_user_data(user_id, fwd)
+                await bot_instance.persist_forwarding_job(job)
             except Exception:
                 pass
+                
             await event.reply(f"✅ Set onchain amount for job {job_index} to {amount}")
         except Exception as e:
             await event.reply(f"Error setting onchain amount: {e}")

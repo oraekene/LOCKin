@@ -1,0 +1,16 @@
+{
+  "user_id": 123,
+  "migration_version": 2,
+  "saved_backtests": [],
+  "backtest_history": [],
+  "forwarding_jobs": [
+    {
+      "id": "job-123",
+      "name": "sample job",
+      "filters": {},
+      "dedup_window_seconds": 60,
+      "cooldown_seconds_per_asset": 86400,
+      "last_triggered_by_asset": {}
+    }
+  ]
+}

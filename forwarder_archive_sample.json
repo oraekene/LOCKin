@@ -1,0 +1,18 @@
+[
+  {
+    "id": "msg1",
+    "timestamp": "2025-10-01T12:00:00Z",
+    "chat_id": 111,
+    "text": "Check out $SOL listing on DEX",
+    "detected_cashtags": ["SOL"],
+    "detected_tokens": ["SOL"]
+  },
+  {
+    "id": "msg2",
+    "timestamp": "2025-10-01T12:00:30Z",
+    "chat_id": 111,
+    "text": "SOL 2x",
+    "detected_cashtags": ["SOL"],
+    "detected_tokens": ["SOL"]
+  }
+]

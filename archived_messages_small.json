@@ -1,0 +1,5 @@
+[
+  {"id":"a1","timestamp":"2025-10-01T11:59:30Z","chat_id":111,"text":"Token $FOO just got listed"},
+  {"id":"a2","timestamp":"2025-10-01T12:00:10Z","chat_id":111,"text":"$FOO looks strong"},
+  {"id":"a3","timestamp":"2025-10-02T13:00:00Z","chat_id":222,"text":"watch $BAR"}
+]

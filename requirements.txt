@@ -10,3 +10,4 @@ hyperliquid-python-sdk>=0.15.0
 aiohttp
 pytest-asyncio
 sentry-sdk
+web3
